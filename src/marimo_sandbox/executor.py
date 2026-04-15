@@ -196,6 +196,34 @@ class NotebookExecutor:
             "error": "marimo did not become ready within 15 seconds",
         }
 
+    # ── Package installation ─────────────────────────────────────────────────
+
+    def install_packages(self, packages: list[str]) -> dict:
+        """Install packages via uv (fallback: pip). Returns {success, output}."""
+        if not packages:
+            return {"success": True, "output": ""}
+        last_error = "no installer found"
+        for cmd in [
+            ["uv", "pip", "install", *packages],
+            [sys.executable, "-m", "pip", "install", *packages],
+        ]:
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                if r.returncode == 0:
+                    return {"success": True, "output": r.stdout}
+                last_error = r.stderr
+            except FileNotFoundError:
+                last_error = f"{cmd[0]} not found"
+        return {"success": False, "output": last_error}
+
+    @staticmethod
+    def check_uv() -> bool:
+        try:
+            result = subprocess.run(["uv", "--version"], capture_output=True, text=True, timeout=5)
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
     # ── Environment checks ───────────────────────────────────────────────────
 
     @staticmethod

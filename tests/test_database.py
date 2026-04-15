@@ -69,3 +69,45 @@ def test_count_runs(db: Database) -> None:
 
 def test_get_run_not_found(db: Database) -> None:
     assert db.get_run("nonexistent") is None
+
+
+def test_delete_run_existing(db: Database) -> None:
+    db.create_run("run_del", "Delete me", "pass", "/tmp/nb.py")
+    assert db.count_runs() == 1
+    result = db.delete_run("run_del")
+    assert result is True
+    assert db.get_run("run_del") is None
+    assert db.count_runs() == 0
+
+
+def test_delete_run_nonexistent(db: Database) -> None:
+    result = db.delete_run("does_not_exist")
+    assert result is False
+
+
+def test_delete_runs_older_than(db: Database) -> None:
+    # Insert 2 "old" rows with a past created_at via raw SQL
+    with db._lock:
+        db._conn.execute(
+            "INSERT INTO runs (run_id, description, code, status, notebook_path, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("run_old1", "Old 1", "pass", "pending", "/tmp/old1.py", "2020-01-01 00:00:00"),
+        )
+        db._conn.execute(
+            "INSERT INTO runs (run_id, description, code, status, notebook_path, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            ("run_old2", "Old 2", "pass", "pending", "/tmp/old2.py", "2020-06-15 12:00:00"),
+        )
+        db._conn.commit()
+
+    # Insert 1 fresh row using normal API (created_at defaults to now)
+    db.create_run("run_fresh", "Fresh", "pass", "/tmp/fresh.py")
+
+    deleted = db.delete_runs_older_than(days=1)
+    assert len(deleted) == 2
+    deleted_ids = {r["run_id"] for r in deleted}
+    assert deleted_ids == {"run_old1", "run_old2"}
+
+    # Fresh run must survive
+    assert db.get_run("run_fresh") is not None
+    assert db.count_runs() == 1

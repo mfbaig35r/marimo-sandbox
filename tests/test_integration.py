@@ -79,3 +79,30 @@ def test_run_error_code(setup) -> None:
 
     assert result.status == "error"
     assert not nb.result_path.exists(), "Sidecar should not exist on error"
+
+
+@pytest.mark.slow
+def test_run_with_packages(setup, tmp_path: Path) -> None:
+    db, gen, exe = setup
+    install_result = exe.install_packages(["requests"])
+    assert install_result["success"], f"Package install failed: {install_result['output']}"
+
+    code = "import requests; print(requests.__version__)"
+    nb = gen.generate("run_requests", "Requests version test", code)
+    db.create_run("run_requests", "Requests version test", code, str(nb.notebook_path))
+
+    result = exe.execute(nb, timeout_seconds=120)
+
+    db.update_run(
+        "run_requests",
+        status=result.status,
+        duration_ms=result.duration_ms,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        error=result.error,
+    )
+
+    assert result.status == "success", f"stderr: {result.stderr}\nerror: {result.error}"
+    assert result.stdout is not None
+    # Version string should contain at least one digit and dot
+    assert any(ch.isdigit() for ch in result.stdout)

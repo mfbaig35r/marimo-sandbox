@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.2.0] - 2026-04-15
+
+### Added
+- `packages=` parameter on `run_python` — install PyPI deps via uv (fallback: pip) before executing
+- `delete_run` tool — remove a run's database record and notebook files
+- `rerun` tool — re-execute a previous run's code by run_id, optionally with modified code
+- `purge_runs` tool — bulk-delete runs older than N days
+- `uv_available` field in `check_setup` response
+
 ## [0.1.0] - 2026-04-14
 
 ### Added

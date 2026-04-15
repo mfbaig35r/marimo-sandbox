@@ -1,5 +1,10 @@
 """Unit tests for executor helper functions."""
 
+from unittest.mock import MagicMock, patch
+
+import pytest
+
+from marimo_sandbox.executor import NotebookExecutor
 from marimo_sandbox.generator import _has_top_level_return, _validate_syntax
 
 # These helpers live in generator.py but are used by the executor indirectly
@@ -54,3 +59,69 @@ def test_has_top_level_return_false_on_no_return() -> None:
 def test_has_top_level_return_false_on_syntax_error() -> None:
     # Should not raise even for invalid code
     assert _has_top_level_return("def(:\n    return 1") is False
+
+
+# ── install_packages tests ────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def executor() -> NotebookExecutor:
+    return NotebookExecutor()
+
+
+def test_install_packages_empty(executor: NotebookExecutor) -> None:
+    with patch("subprocess.run") as mock_run:
+        result = executor.install_packages([])
+        mock_run.assert_not_called()
+    assert result["success"] is True
+    assert result["output"] == ""
+
+
+def test_install_packages_uv_success(executor: NotebookExecutor) -> None:
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = "Successfully installed requests"
+    with patch("subprocess.run", return_value=mock_result) as mock_run:
+        result = executor.install_packages(["requests"])
+        # Only one call — uv succeeded, pip should not be called
+        assert mock_run.call_count == 1
+        called_cmd = mock_run.call_args[0][0]
+        assert called_cmd[0] == "uv"
+    assert result["success"] is True
+    assert "Successfully installed" in result["output"]
+
+
+def test_install_packages_uv_missing_falls_back_to_pip(executor: NotebookExecutor) -> None:
+    pip_result = MagicMock()
+    pip_result.returncode = 0
+    pip_result.stdout = "Successfully installed requests"
+
+    def side_effect(cmd, **kwargs):
+        if cmd[0] == "uv":
+            raise FileNotFoundError("uv not found")
+        return pip_result
+
+    with patch("subprocess.run", side_effect=side_effect) as mock_run:
+        result = executor.install_packages(["requests"])
+        assert mock_run.call_count == 2
+    assert result["success"] is True
+
+
+def test_install_packages_both_fail(executor: NotebookExecutor) -> None:
+    uv_result = MagicMock()
+    uv_result.returncode = 1
+    uv_result.stderr = "uv error: no such package"
+
+    pip_result = MagicMock()
+    pip_result.returncode = 1
+    pip_result.stderr = "pip error: no such package"
+
+    def side_effect(cmd, **kwargs):
+        if cmd[0] == "uv":
+            return uv_result
+        return pip_result
+
+    with patch("subprocess.run", side_effect=side_effect):
+        result = executor.install_packages(["nonexistent-pkg-xyz"])
+    assert result["success"] is False
+    assert result["output"]  # some error message present

@@ -107,3 +107,24 @@ class Database:
     def count_runs(self) -> int:
         row = self._fetchone("SELECT COUNT(*) AS n FROM runs")
         return int(row["n"]) if row else 0
+
+    def delete_run(self, run_id: str) -> bool:
+        """Delete a single run record. Returns True if it existed."""
+        if self.get_run(run_id) is None:
+            return False
+        self._execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+        return True
+
+    def delete_runs_older_than(self, days: int) -> list[dict]:
+        """Delete runs older than `days` days. Returns deleted rows (run_id, notebook_path)."""
+        rows = self._fetchall(
+            "SELECT run_id, notebook_path FROM runs WHERE created_at < datetime('now', ?)",
+            (f"-{days} days",),
+        )
+        if rows:
+            placeholders = ",".join("?" * len(rows))
+            self._execute(
+                f"DELETE FROM runs WHERE run_id IN ({placeholders})",
+                tuple(r["run_id"] for r in rows),
+            )
+        return rows
