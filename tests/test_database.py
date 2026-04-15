@@ -313,3 +313,148 @@ def test_list_pending_approvals_returns_all(db: Database) -> None:
     assert len(rows) == 3
     tokens = {r["token"] for r in rows}
     assert tokens == {"approval_0", "approval_1", "approval_2"}
+
+
+# ── v0.7 additions ────────────────────────────────────────────────────────────
+
+
+def test_purge_expired_approvals(db: Database) -> None:
+    # Insert one expired and one valid approval
+    db.create_pending_approval(
+        token="approval_expired",
+        run_id="run_001",
+        code="pass",
+        description="Expired",
+        packages=[],
+        timeout_seconds=60,
+        sandbox=False,
+        risk_findings_json="[]",
+        expires_at="2020-01-01T00:00:00+00:00",  # in the past
+    )
+    db.create_pending_approval(
+        token="approval_valid",
+        run_id="run_002",
+        code="pass",
+        description="Valid",
+        packages=[],
+        timeout_seconds=60,
+        sandbox=False,
+        risk_findings_json="[]",
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    deleted = db.purge_expired_approvals()
+    assert deleted == 1
+    assert db.get_pending_approval("approval_expired") is None
+    assert db.get_pending_approval("approval_valid") is not None
+
+
+def test_purge_expired_approvals_none_expired(db: Database) -> None:
+    db.create_pending_approval(
+        token="approval_future",
+        run_id="run_001",
+        code="pass",
+        description="Future",
+        packages=[],
+        timeout_seconds=60,
+        sandbox=False,
+        risk_findings_json="[]",
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    deleted = db.purge_expired_approvals()
+    assert deleted == 0
+
+
+def test_create_run_with_parent_run_id(db: Database) -> None:
+    db.create_run("run_parent", "Parent run", "pass", "/tmp/nb.py")
+    db.create_run("run_child", "Child run", "pass", "/tmp/nb2.py", parent_run_id="run_parent")
+    child = db.get_run("run_child")
+    assert child is not None
+    assert child.parent_run_id == "run_parent"
+
+
+def test_create_run_default_parent_run_id_is_none(db: Database) -> None:
+    db.create_run("run_no_parent", "No parent", "pass", "/tmp/nb.py")
+    row = db.get_run("run_no_parent")
+    assert row is not None
+    assert row.parent_run_id is None
+
+
+# ── v0.8 additions ────────────────────────────────────────────────────────────
+
+
+def test_create_run_with_running_status(db: Database) -> None:
+    db.create_run("run_async", "Async run", "pass", "/tmp/nb.py", status="running")
+    row = db.get_run("run_async")
+    assert row is not None
+    assert row.status == RunStatus.RUNNING
+
+
+def test_update_run_pid(db: Database) -> None:
+    db.create_run("run_pid", "PID test", "pass", "/tmp/nb.py")
+    db.update_run_pid("run_pid", 12345)
+    row = db.get_run("run_pid")
+    assert row is not None
+    assert row.pid == 12345
+
+
+def test_startup_recovery_resets_running_runs(tmp_path: Path) -> None:
+    """Runs stuck in 'running' should be reset to 'error' on DB open."""
+    db_path = tmp_path / "recovery.db"
+    db1 = Database(db_path)
+    db1.create_run("run_stuck", "Stuck run", "pass", "/tmp/nb.py", status="running")
+    row = db1.get_run("run_stuck")
+    assert row is not None
+    assert row.status == RunStatus.RUNNING
+
+    # Re-open the database (simulates server restart)
+    db2 = Database(db_path)
+    row2 = db2.get_run("run_stuck")
+    assert row2 is not None
+    assert row2.status == RunStatus.ERROR
+    assert row2.error is not None and "Interrupted" in row2.error
+
+
+def test_update_run_cancelled_status(db: Database) -> None:
+    db.create_run("run_cancel", "Cancel test", "pass", "/tmp/nb.py")
+    db.update_run("run_cancel", status="cancelled", duration_ms=0)
+    row = db.get_run("run_cancel")
+    assert row is not None
+    assert row.status == RunStatus.CANCELLED
+
+
+# ── v1.0.0 additions ──────────────────────────────────────────────────────────
+
+
+def test_list_runs_offset(db: Database) -> None:
+    """Inserting 5 runs and offsetting by 3 should return exactly 2 runs."""
+    for i in range(5):
+        db.create_run(f"run_{i:03d}", f"Run {i}", "pass", f"/tmp/nb{i}.py")
+
+    result = db.list_runs(limit=20, offset=3)
+    assert len(result) == 2
+
+
+def test_list_runs_offset_beyond_end(db: Database) -> None:
+    """Offset greater than total count should return an empty list."""
+    db.create_run("run_001", "Run 1", "pass", "/tmp/nb1.py")
+    db.create_run("run_002", "Run 2", "pass", "/tmp/nb2.py")
+
+    result = db.list_runs(limit=20, offset=100)
+    assert result == []
+
+
+# ── v0.9 additions ────────────────────────────────────────────────────────────
+
+
+def test_create_run_with_env_hash(db: Database) -> None:
+    db.create_run("run_env", "Env test", "pass", "/tmp/nb.py", env_hash="abc1234567890abc")
+    row = db.get_run("run_env")
+    assert row is not None
+    assert row.env_hash == "abc1234567890abc"
+
+
+def test_create_run_default_env_hash_is_none(db: Database) -> None:
+    db.create_run("run_noenv", "No env", "pass", "/tmp/nb.py")
+    row = db.get_run("run_noenv")
+    assert row is not None
+    assert row.env_hash is None

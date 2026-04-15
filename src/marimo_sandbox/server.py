@@ -16,24 +16,34 @@ read_artifact           Read the content of an artifact file.
 get_run_outputs         Retrieve the structured __outputs__ dict from a run.
 approve_run             Confirm a blocked run and execute it.
 list_pending_approvals  List runs awaiting approval.
+cancel_run              Cancel a running async run.
+diff_runs               Compare two runs: code, env, status, artifacts, and outputs.
+list_environments       List cached virtual environments.
+clean_environments      Delete old cached virtual environments.
 """
 
 import base64
+import difflib
 import hashlib
 import json
 import mimetypes
 import os
 import secrets
 import shutil
+import signal
+import subprocess
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastmcp import FastMCP
 
 from .database import Database
+from .env_manager import EnvManager
 from .executor import NotebookExecutor
-from .generator import NotebookGenerator
-from .models import RunStatus
+from .generator import GeneratedNotebook, NotebookGenerator
+from .models import RunRecord, RunStatus
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -53,6 +63,7 @@ DOCKER_IMAGE = os.environ.get(
 db = Database(DATA_DIR / "sandbox.db")
 generator = NotebookGenerator(DATA_DIR / "notebooks")
 executor = NotebookExecutor(docker_image=DOCKER_IMAGE)
+env_manager = EnvManager(DATA_DIR / "envs")
 
 # ── Server ────────────────────────────────────────────────────────────────────
 
@@ -72,9 +83,46 @@ mcp = FastMCP(
         "Use list_artifacts / read_artifact to inspect files created by a run. "
         "Use get_run_outputs to read the structured __outputs__ dict. "
         "Use dry_run=True on run_python for static risk analysis without execution. "
-        "Use require_approval=True to block runs with critical risk findings."
+        "Use require_approval=True to block runs with critical risk findings. "
+        "Use async_mode=True to launch in background; poll with get_run; cancel with cancel_run."
+        " Use list_environments / clean_environments to manage the venv cache."
+        " Use diff_runs(run_id, compare_to=None) to compare two runs:"
+        " code, env, status, artifacts, and outputs."
     ),
 )
+
+
+# ── Background watcher (async mode) ───────────────────────────────────────────
+
+
+def _watch_run(
+    run_id: str,
+    process: "subprocess.Popen[str]",
+    notebook: GeneratedNotebook,
+    timeout_seconds: int,
+    start_ms: float,
+) -> None:
+    try:
+        process.wait(timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+    duration_ms = int((time.monotonic() - start_ms) * 1000)
+    stdout = process.stdout.read() if process.stdout else ""
+    stderr = process.stderr.read() if process.stderr else ""
+    result = executor._finish_result(
+        notebook, process.returncode or 0, stdout, stderr, duration_ms
+    )
+    artifacts = _scan_artifacts(notebook.notebook_dir, run_id)
+    db.update_run(
+        run_id,
+        status=result.status,
+        duration_ms=result.duration_ms,
+        stdout=result.stdout,
+        stderr=result.stderr,
+        error=result.error,
+        artifacts=artifacts or None,
+    )
 
 
 # ── Private helpers ────────────────────────────────────────────────────────────
@@ -101,6 +149,8 @@ def _impl_run_python(
     packages: list[str] | None,
     dry_run: bool = False,
     require_approval: bool = False,
+    parent_run_id: str | None = None,
+    async_mode: bool = False,
 ) -> dict:
     if packages is None:
         packages = []
@@ -166,22 +216,27 @@ def _impl_run_python(
     code_hash = hashlib.sha256(code.encode()).hexdigest()
     run_id = "run_" + secrets.token_hex(4)
 
-    # Install packages before generating/executing
+    # Resolve packages → hash-based venv (or bare interpreter)
     freeze: str | None = None
+    python_path: Path | None = None
+    env_hash: str | None = None
     if packages:
-        install_result = executor.install_packages(packages)
-        if not install_result["success"]:
+        try:
+            env_info = env_manager.get_or_create(packages)
+            freeze = env_info.freeze or None
+            python_path = env_info.python_path
+            env_hash = env_info.env_hash
+        except Exception as exc:
             return {
                 "run_id": None,
                 "status": "error",
-                "error": f"Package install failed: {install_result['output']}",
+                "error": f"Package install failed: {exc}",
                 "stdout": "",
                 "stderr": "",
                 "duration_ms": 0,
                 "notebook_path": None,
                 "view_command": None,
             }
-        freeze = install_result.get("freeze") or None
 
     # Generate notebook
     try:
@@ -202,6 +257,47 @@ def _impl_run_python(
             "view_command": None,
         }
 
+    if async_mode:
+        # Persist as 'running' immediately
+        db.create_run(
+            run_id=run_id,
+            description=description,
+            code=code,
+            notebook_path=str(notebook.notebook_path),
+            packages=packages,
+            code_hash=code_hash,
+            parent_run_id=parent_run_id,
+            status="running",
+            env_hash=env_hash,
+        )
+        start_ms = time.monotonic()
+        process = executor.execute_async(
+            notebook=notebook,
+            timeout_seconds=timeout_seconds,
+            sandbox=sandbox,
+            python_path=python_path,
+        )
+        db.update_run_pid(run_id, process.pid)
+        threading.Thread(
+            target=_watch_run,
+            args=(run_id, process, notebook, timeout_seconds, start_ms),
+            daemon=True,
+        ).start()
+        response: dict = {
+            "run_id": run_id,
+            "status": "running",
+            "notebook_path": str(notebook.notebook_path),
+            "view_command": f'marimo edit "{notebook.notebook_path}"',
+            "code_hash": code_hash,
+        }
+        if packages:
+            response["packages_installed"] = packages
+        if freeze:
+            response["freeze"] = freeze
+        if findings:
+            response["risk_findings"] = findings_dicts
+        return response
+
     # Persist pending record before executing (so it's visible even if we crash)
     db.create_run(
         run_id=run_id,
@@ -210,6 +306,8 @@ def _impl_run_python(
         notebook_path=str(notebook.notebook_path),
         packages=packages,
         code_hash=code_hash,
+        parent_run_id=parent_run_id,
+        env_hash=env_hash,
     )
 
     # Execute
@@ -217,6 +315,7 @@ def _impl_run_python(
         notebook=notebook,
         timeout_seconds=timeout_seconds,
         sandbox=sandbox,
+        python_path=python_path,
     )
 
     # Scan for user-created artifact files
@@ -235,7 +334,7 @@ def _impl_run_python(
         risk_findings=findings_dicts or None,
     )
 
-    response: dict = {
+    response = {
         "run_id": run_id,
         "status": result.status,
         "stdout": result.stdout or "",
@@ -254,6 +353,244 @@ def _impl_run_python(
     if findings:
         response["risk_findings"] = findings_dicts
     return response
+
+
+def _build_explanation(
+    run_a: RunRecord,
+    run_b: RunRecord,
+    relationship: str,
+    summary: dict,
+    code_diff: dict,
+    env_diff: dict,
+    status_diff: dict,
+    artifact_diff: dict,
+    output_diff: dict,
+) -> str:
+    parts = []
+    rel_label = {
+        "parent_child": f"Run {run_b.run_id} is a direct rerun of {run_a.run_id}.",
+        "siblings": f"Runs {run_a.run_id} and {run_b.run_id} are siblings from the same parent.",
+        "unrelated": f"Runs {run_a.run_id} and {run_b.run_id} are unrelated.",
+    }[relationship]
+    parts.append(rel_label)
+    if summary["code_changed"]:
+        parts.append(
+            f"The code changed ({code_diff['lines_added']} line(s) added, "
+            f"{code_diff['lines_removed']} removed)."
+        )
+    else:
+        parts.append("The code did not change.")
+    if summary["env_changed"]:
+        added = env_diff["packages_added"]
+        removed = env_diff["packages_removed"]
+        env_parts = []
+        if added:
+            env_parts.append(f"added {', '.join(added)}")
+        if removed:
+            env_parts.append(f"removed {', '.join(removed)}")
+        parts.append(f"The environment changed ({'; '.join(env_parts)}).")
+    else:
+        parts.append("The environment did not change.")
+    if summary["status_changed"]:
+        parts.append(f"Status changed from {status_diff['before']} to {status_diff['after']}.")
+    if summary["artifacts_changed"]:
+        a_parts = []
+        if artifact_diff["added"]:
+            a_parts.append(f"{len(artifact_diff['added'])} artifact(s) added")
+        if artifact_diff["removed"]:
+            a_parts.append(f"{len(artifact_diff['removed'])} removed")
+        parts.append(f"Artifacts changed ({', '.join(a_parts)}).")
+    if output_diff.get("available") and summary["outputs_changed"]:
+        n = len(output_diff.get("changed_keys", {}))
+        parts.append(f"{n} output field(s) changed.")
+    return " ".join(parts)
+
+
+def _impl_diff_runs(run_id: str, compare_to: str | None = None) -> dict:
+    # 1. Fetch run_b (the run being inspected)
+    run_b = db.get_run(run_id)
+    if not run_b:
+        return {"error": f"Run not found: {run_id}"}
+
+    # 2. Resolve reference run
+    ref_id = compare_to or run_b.parent_run_id
+    if not ref_id:
+        return {
+            "error": (
+                f"Run {run_id} has no parent_run_id. "
+                "Provide an explicit compare_to run ID."
+            )
+        }
+
+    # 3. Fetch run_a (the reference / older run)
+    run_a = db.get_run(ref_id)
+    if not run_a:
+        return {"error": f"Reference run not found: {ref_id}"}
+
+    # 4. Relationship classification
+    if run_b.parent_run_id == run_a.run_id:
+        relationship = "parent_child"
+    elif run_a.parent_run_id is not None and run_a.parent_run_id == run_b.parent_run_id:
+        relationship = "siblings"
+    else:
+        relationship = "unrelated"
+
+    # 5. Code diff
+    code_hash_changed = run_a.code_hash != run_b.code_hash
+    lines_added = 0
+    lines_removed = 0
+    diff_text: str | None = None
+    if code_hash_changed:
+        a_lines = (run_a.code or "").splitlines(keepends=True)
+        b_lines = (run_b.code or "").splitlines(keepends=True)
+        diff_lines = list(difflib.unified_diff(
+            a_lines, b_lines,
+            fromfile=f"{run_a.run_id}/code",
+            tofile=f"{run_b.run_id}/code",
+        ))
+        for line in diff_lines:
+            if line.startswith("+") and not line.startswith("+++"):
+                lines_added += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                lines_removed += 1
+        diff_text = "".join(diff_lines) or None
+        if diff_text and len(diff_text) > 8000:
+            diff_text = diff_text[:8000] + "\n... (truncated)"
+    code_diff = {
+        "changed": code_hash_changed,
+        "hash_before": run_a.code_hash,
+        "hash_after": run_b.code_hash,
+        "lines_added": lines_added,
+        "lines_removed": lines_removed,
+        "diff_text": diff_text,
+    }
+
+    # 6. Env diff
+    env_hash_changed = run_a.env_hash != run_b.env_hash
+    pkgs_before = set(run_a.packages)
+    pkgs_after = set(run_b.packages)
+    env_diff = {
+        "changed": env_hash_changed,
+        "hash_before": run_a.env_hash,
+        "hash_after": run_b.env_hash,
+        "packages_before": sorted(run_a.packages),
+        "packages_after": sorted(run_b.packages),
+        "packages_added": sorted(pkgs_after - pkgs_before),
+        "packages_removed": sorted(pkgs_before - pkgs_after),
+    }
+
+    # 7. Status diff
+    status_diff = {
+        "before": str(run_a.status),
+        "after": str(run_b.status),
+        "changed": run_a.status != run_b.status,
+    }
+
+    # 8. Artifact diff
+    artifacts_a = set(run_a.artifacts)
+    artifacts_b = set(run_b.artifacts)
+    artifact_diff = {
+        "changed": artifacts_a != artifacts_b,
+        "added": sorted(artifacts_b - artifacts_a),
+        "removed": sorted(artifacts_a - artifacts_b),
+        "common": sorted(artifacts_a & artifacts_b),
+    }
+
+    # 9. Output diff — read sidecar JSONs from disk
+    def _read_sidecar_outputs(run: RunRecord) -> dict | None:
+        nb_dir = Path(run.notebook_path).parent
+        result_path = nb_dir / f"{run.run_id}_result.json"
+        if not result_path.exists():
+            return None
+        try:
+            data: dict = json.loads(result_path.read_text())
+            return dict(data.get("outputs", {}))
+        except (json.JSONDecodeError, OSError):
+            return None
+
+    outputs_a = _read_sidecar_outputs(run_a)
+    outputs_b = _read_sidecar_outputs(run_b)
+    if outputs_a is not None and outputs_b is not None:
+        keys_a = set(outputs_a.keys())
+        keys_b = set(outputs_b.keys())
+        added_keys = sorted(keys_b - keys_a)
+        removed_keys = sorted(keys_a - keys_b)
+        changed_keys: dict = {}
+        for key in keys_a & keys_b:
+            if outputs_a[key] != outputs_b[key]:
+                changed_keys[key] = {"before": outputs_a[key], "after": outputs_b[key]}
+        output_diff: dict = {
+            "available": True,
+            "changed": bool(added_keys or removed_keys or changed_keys),
+            "added_keys": added_keys,
+            "removed_keys": removed_keys,
+            "changed_keys": changed_keys,
+        }
+    else:
+        output_diff = {
+            "available": False,
+            "changed": False,
+            "added_keys": [],
+            "removed_keys": [],
+            "changed_keys": {},
+        }
+
+    # 10. Duration diff (flag if >20% change)
+    before_ms = run_a.duration_ms
+    after_ms = run_b.duration_ms
+    delta_ms: int | None
+    if before_ms is not None and after_ms is not None:
+        delta_ms = after_ms - before_ms
+        if before_ms == 0:
+            duration_changed = after_ms != 0
+        else:
+            duration_changed = abs(delta_ms) / before_ms > 0.20
+    else:
+        delta_ms = None
+        duration_changed = False
+    duration_diff = {
+        "before_ms": before_ms,
+        "after_ms": after_ms,
+        "delta_ms": delta_ms,
+        "changed": duration_changed,
+    }
+
+    # 11. Summary flags
+    summary = {
+        "code_changed": code_diff["changed"],
+        "env_changed": env_diff["changed"],
+        "status_changed": status_diff["changed"],
+        "artifacts_changed": artifact_diff["changed"],
+        "outputs_changed": output_diff["changed"],
+        "duration_changed": duration_diff["changed"],
+    }
+
+    # 12. Plain-English explanation
+    explanation = _build_explanation(
+        run_a=run_a,
+        run_b=run_b,
+        relationship=relationship,
+        summary=summary,
+        code_diff=code_diff,
+        env_diff=env_diff,
+        status_diff=status_diff,
+        artifact_diff=artifact_diff,
+        output_diff=output_diff,
+    )
+
+    return {
+        "run_a": run_a.run_id,
+        "run_b": run_b.run_id,
+        "relationship": relationship,
+        "summary": summary,
+        "status_diff": status_diff,
+        "code_diff": code_diff,
+        "env_diff": env_diff,
+        "artifact_diff": artifact_diff,
+        "output_diff": output_diff,
+        "duration_diff": duration_diff,
+        "explanation": explanation,
+    }
 
 
 def _impl_delete_run(run_id: str, delete_files: bool = True) -> dict:
@@ -296,10 +633,18 @@ def _impl_rerun(
         timeout_seconds=timeout_seconds,
         sandbox=sandbox,
         packages=packages if packages is not None else original.packages,
+        parent_run_id=run_id,
     )
 
 
-def _impl_purge_runs(older_than_days: int, delete_files: bool) -> dict:
+def _impl_purge_runs(older_than_days: int, delete_files: bool, dry_run: bool = False) -> dict:
+    if dry_run:
+        rows = db.list_runs_older_than(older_than_days)
+        return {
+            "dry_run": True,
+            "would_delete_runs": len(rows),
+            "run_ids": [r.run_id for r in rows],
+        }
     rows = db.delete_runs_older_than(older_than_days)
     files_deleted = 0
     if delete_files:
@@ -421,7 +766,52 @@ def _impl_approve_run(token: str, reason: str = "") -> dict:
     )
 
 
+def _impl_list_environments() -> dict:
+    envs = env_manager.list_envs()
+    return {
+        "count": len(envs),
+        "environments": [
+            {
+                "env_hash": e.env_hash,
+                "packages": e.packages,
+                "size_bytes": e.size_bytes,
+                "created_at": e.created_at,
+                "last_used_at": e.last_used_at,
+            }
+            for e in envs
+        ],
+    }
+
+
+def _impl_clean_environments(older_than_days: int = 90) -> dict:
+    envs_before = env_manager.list_envs()
+    sizes = {e.env_hash: e.size_bytes for e in envs_before}
+    deleted = env_manager.clean_old_envs(older_than_days)
+    freed_bytes = sum(sizes.get(h, 0) for h in deleted)
+    return {
+        "deleted_count": len(deleted),
+        "deleted_hashes": deleted,
+        "freed_bytes": freed_bytes,
+    }
+
+
+def _impl_cancel_run(run_id: str) -> dict:
+    run = db.get_run(run_id)
+    if not run:
+        return {"error": f"Run not found: {run_id}"}
+    if run.status != RunStatus.RUNNING:
+        return {"error": f"Run is not running (status: {run.status})"}
+    if run.pid:
+        try:
+            os.kill(run.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass  # already finished
+    db.update_run(run_id, status="cancelled", duration_ms=0)
+    return {"success": True, "run_id": run_id, "pid": run.pid}
+
+
 def _impl_list_pending_approvals() -> dict:
+    db.purge_expired_approvals()
     rows = db.list_pending_approvals()
     now = datetime.now(timezone.utc).isoformat()
     pending = [
@@ -455,6 +845,7 @@ def run_python(
     packages: list[str] | None = None,
     dry_run: bool = False,
     require_approval: bool = False,
+    async_mode: bool = False,
 ) -> dict:
     """
     Execute Python code in a Marimo notebook.
@@ -479,15 +870,19 @@ def run_python(
         dry_run:          If True, return static risk analysis only — do not execute.
         require_approval: If True, block execution when critical risk patterns are found
                           and return an approval_token to confirm via approve_run().
+        async_mode:       If True, launch execution in the background and return
+                          immediately with status="running". Poll with get_run();
+                          cancel with cancel_run().
 
     Returns:
         run_id, status, stdout, stderr, error, duration_ms,
         notebook_path, view_command, code_hash, artifacts,
         risk_findings (if any), packages_installed (if any), freeze (if any).
+        When async_mode=True: run_id, status="running", notebook_path, view_command, code_hash.
     """
     return _impl_run_python(
         code, description, timeout_seconds, sandbox, packages,
-        dry_run=dry_run, require_approval=require_approval,
+        dry_run=dry_run, require_approval=require_approval, async_mode=async_mode,
     )
 
 
@@ -521,23 +916,13 @@ def open_notebook(run_id: str, port: int = 2718) -> dict:
     return executor.open_interactive(notebook_path, port=port)
 
 
-@mcp.tool()
-def list_runs(
+def _impl_list_runs(
     limit: int = 20,
     status: str | None = None,
+    offset: int = 0,
 ) -> dict:
-    """
-    List recent Python runs.
-
-    Args:
-        limit:   Max number of runs to return (default 20).
-        status:  Filter to 'success', 'error', or 'pending'. Omit for all.
-
-    Returns:
-        count, runs — each entry has run_id, description, status,
-        duration_ms, created_at, notebook_path.
-    """
-    runs = db.list_runs(limit=limit, status=RunStatus(status) if status else None)
+    status_enum = RunStatus(status) if status else None
+    runs = db.list_runs(limit=limit, status=status_enum, offset=offset)
     slim = [
         {
             "run_id": r.run_id,
@@ -549,7 +934,73 @@ def list_runs(
         }
         for r in runs
     ]
-    return {"count": len(slim), "runs": slim}
+    return {
+        "total": db.count_runs(status=status_enum),
+        "count": len(slim),
+        "offset": offset,
+        "runs": slim,
+    }
+
+
+@mcp.tool()
+def list_runs(
+    limit: int = 20,
+    status: str | None = None,
+    offset: int = 0,
+) -> dict:
+    """
+    List recent Python runs.
+
+    Args:
+        limit:   Max number of runs to return (default 20).
+        status:  Filter to 'success', 'error', or 'pending'. Omit for all.
+        offset:  Number of runs to skip (for pagination, default 0).
+
+    Returns:
+        total, count, offset, runs — each entry has run_id, description, status,
+        duration_ms, created_at, notebook_path.
+    """
+    return _impl_list_runs(limit, status, offset)
+
+
+def _impl_get_run(
+    run_id: str,
+    include_code: bool = True,
+    include_notebook_source: bool = False,
+) -> dict:
+    run = db.get_run(run_id)
+    if not run:
+        return {"error": f"Run not found: {run_id}"}
+
+    result: dict[str, object] = {
+        "run_id": run.run_id,
+        "description": run.description,
+        "status": run.status,
+        "duration_ms": run.duration_ms,
+        "stdout": run.stdout or "",
+        "stderr": run.stderr or "",
+        "error": run.error,
+        "notebook_path": run.notebook_path,
+        "view_command": f'marimo edit "{run.notebook_path}"',
+        "created_at": str(run.created_at),
+        "parent_run_id": run.parent_run_id,
+    }
+
+    result["code_hash"] = run.code_hash
+    result["env_hash"] = run.env_hash
+    result["freeze"] = run.freeze
+    result["risk_findings"] = run.risk_findings
+
+    if include_code:
+        result["code"] = run.code
+
+    if include_notebook_source:
+        nb_path = Path(run.notebook_path)
+        result["notebook_source"] = (
+            nb_path.read_text(encoding="utf-8") if nb_path.exists() else None
+        )
+
+    return result
 
 
 @mcp.tool()
@@ -572,33 +1023,7 @@ def get_run(
         duration_ms, notebook_path, view_command, created_at, and optionally
         code and notebook_source.
     """
-    run = db.get_run(run_id)
-    if not run:
-        return {"error": f"Run not found: {run_id}"}
-
-    result = {
-        "run_id": run.run_id,
-        "description": run.description,
-        "status": run.status,
-        "duration_ms": run.duration_ms,
-        "stdout": run.stdout or "",
-        "stderr": run.stderr or "",
-        "error": run.error,
-        "notebook_path": run.notebook_path,
-        "view_command": f'marimo edit "{run.notebook_path}"',
-        "created_at": str(run.created_at),
-    }
-
-    if include_code:
-        result["code"] = run.code
-
-    if include_notebook_source:
-        nb_path = Path(run.notebook_path)
-        result["notebook_source"] = (
-            nb_path.read_text(encoding="utf-8") if nb_path.exists() else None
-        )
-
-    return result
+    return _impl_get_run(run_id, include_code, include_notebook_source)
 
 
 @mcp.tool()
@@ -676,18 +1101,25 @@ def rerun(
 
 
 @mcp.tool()
-def purge_runs(older_than_days: int = 30, delete_files: bool = True) -> dict:
+def purge_runs(
+    older_than_days: int = 30,
+    delete_files: bool = True,
+    dry_run: bool = False,
+) -> dict:
     """
     Bulk-delete runs older than N days to reclaim disk space.
 
     Args:
         older_than_days:  Delete runs created more than this many days ago (default 30).
         delete_files:     Also remove notebook directories from disk (default True).
+        dry_run:          If True, return a preview of what would be deleted without
+                          actually deleting anything (default False).
 
     Returns:
-        deleted_runs, files_deleted, run_ids.
+        When dry_run=False: deleted_runs, files_deleted, run_ids.
+        When dry_run=True:  dry_run=True, would_delete_runs, run_ids.
     """
-    return _impl_purge_runs(older_than_days, delete_files)
+    return _impl_purge_runs(older_than_days, delete_files, dry_run=dry_run)
 
 
 @mcp.tool()
@@ -779,6 +1211,85 @@ def list_pending_approvals() -> dict:
         created_at, expires_at, expired, critical_finding_count.
     """
     return _impl_list_pending_approvals()
+
+
+@mcp.tool()
+def cancel_run(run_id: str) -> dict:
+    """
+    Cancel a run that is currently executing (async_mode=True).
+
+    Sends SIGTERM to the process and marks the run as 'cancelled' in the DB.
+
+    Args:
+        run_id:  The run to cancel (must have status 'running').
+
+    Returns:
+        success, run_id, pid — or error if the run is not found or not running.
+    """
+    return _impl_cancel_run(run_id)
+
+
+@mcp.tool()
+def diff_runs(run_id: str, compare_to: str | None = None) -> dict:
+    """
+    Compare two runs and explain what changed between them.
+
+    By default compares run_id against its parent (the run it was re-executed from).
+    Supply compare_to to override the reference run — either run can have any status.
+
+    Args:
+        run_id:     The run to inspect (the "after" / newer run).
+        compare_to: ID of the reference run (the "before" / older run).
+                    Defaults to run_id's parent_run_id. Required if the run has no parent.
+
+    Returns:
+        run_a, run_b            — reference and inspected run IDs.
+        relationship            — "parent_child", "siblings", or "unrelated".
+        summary                 — dict of bool flags: code_changed, env_changed,
+                                  status_changed, artifacts_changed, outputs_changed,
+                                  duration_changed.
+        status_diff             — before/after status strings and changed flag.
+        code_diff               — changed, hash_before, hash_after, lines_added, lines_removed.
+        env_diff                — changed, hash_before, hash_after, packages_before,
+                                  packages_after, packages_added, packages_removed.
+        artifact_diff           — changed, added, removed, common (lists of relative paths).
+        output_diff             — available, changed, added_keys, removed_keys, changed_keys
+                                  (shallow comparison of __outputs__ dict; available=False if
+                                  either run has no result sidecar).
+        duration_diff           — before_ms, after_ms, delta_ms, changed (>20% threshold).
+        explanation             — 1-3 sentence plain-English summary of what changed.
+    """
+    return _impl_diff_runs(run_id, compare_to)
+
+
+@mcp.tool()
+def list_environments() -> dict:
+    """
+    List cached virtual environments (hash-based venv cache).
+
+    Each environment corresponds to a unique set of packages. Environments are
+    reused automatically when run_python is called with the same package list.
+
+    Returns:
+        count, environments — each entry has env_hash, packages, size_bytes,
+        created_at, last_used_at.
+    """
+    return _impl_list_environments()
+
+
+@mcp.tool()
+def clean_environments(older_than_days: int = 90) -> dict:
+    """
+    Delete cached virtual environments that haven't been used recently.
+
+    Args:
+        older_than_days:  Delete envs whose last_used_at is older than this many
+                          days (default 90).
+
+    Returns:
+        deleted_count, deleted_hashes, freed_bytes.
+    """
+    return _impl_clean_environments(older_than_days)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

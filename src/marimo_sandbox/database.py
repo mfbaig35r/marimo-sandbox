@@ -5,6 +5,7 @@ SQLite persistence for marimo-sandbox.
 import json
 import sqlite3
 import threading
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import DeletedRunInfo, RunRecord, RunStatus
@@ -78,6 +79,39 @@ class Database:
                 self._conn.commit()
             except sqlite3.OperationalError:
                 pass  # column already exists
+            # v0.7 migration: parent_run_id column
+            try:
+                self._conn.execute(
+                    "ALTER TABLE runs ADD COLUMN parent_run_id TEXT"
+                )
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            # v0.8 migration: pid column
+            try:
+                self._conn.execute(
+                    "ALTER TABLE runs ADD COLUMN pid INTEGER"
+                )
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            # v0.9 migration: env_hash column
+            try:
+                self._conn.execute(
+                    "ALTER TABLE runs ADD COLUMN env_hash TEXT"
+                )
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            # v0.8 startup recovery: reset stuck 'running' runs
+            try:
+                self._conn.execute(
+                    "UPDATE runs SET status='error', error=? WHERE status='running'",
+                    ("Interrupted: server restarted during execution",)
+                )
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass  # Pre-v0.1 legacy DB without error column; no running rows possible
 
     # ── Internal helpers ─────────────────────────────────────────────────────
 
@@ -112,12 +146,25 @@ class Database:
         notebook_path: str,
         packages: list[str] | None = None,
         code_hash: str | None = None,
+        parent_run_id: str | None = None,
+        status: str = "pending",
+        env_hash: str | None = None,
     ) -> None:
         self._execute(
             "INSERT INTO runs "
-            "(run_id, description, code, status, notebook_path, packages, code_hash) "
-            "VALUES (?, ?, ?, 'pending', ?, ?, ?)",
-            (run_id, description, code, notebook_path, json.dumps(packages or []), code_hash),
+            "(run_id, description, code, status, notebook_path, packages, "
+            "code_hash, parent_run_id, env_hash) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                run_id, description, code, status, notebook_path,
+                json.dumps(packages or []), code_hash, parent_run_id, env_hash,
+            ),
+        )
+
+    def update_run_pid(self, run_id: str, pid: int) -> None:
+        self._execute(
+            "UPDATE runs SET pid=? WHERE run_id=?",
+            (pid, run_id),
         )
 
     def update_run(
@@ -154,26 +201,32 @@ class Database:
         self,
         limit: int = 20,
         status: RunStatus | None = None,
+        offset: int = 0,
     ) -> list[RunRecord]:
         if status:
             return [
                 self._parse_run(r)
                 for r in self._fetchall(
-                    "SELECT * FROM runs WHERE status = ? ORDER BY created_at DESC LIMIT ?",
-                    (status, limit),
+                    "SELECT * FROM runs WHERE status = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                    (status, limit, offset),
                 )
             ]
         return [
             self._parse_run(r)
             for r in self._fetchall(
-                "SELECT * FROM runs ORDER BY created_at DESC LIMIT ?",
-                (limit,),
+                "SELECT * FROM runs ORDER BY created_at DESC LIMIT ? OFFSET ?",
+                (limit, offset),
             )
         ]
 
-    def count_runs(self) -> int:
+    def count_runs(self, status: RunStatus | None = None) -> int:
         with self._lock:
-            row = self._conn.execute("SELECT COUNT(*) AS n FROM runs").fetchone()
+            if status:
+                row = self._conn.execute(
+                    "SELECT COUNT(*) AS n FROM runs WHERE status = ?", (status,)
+                ).fetchone()
+            else:
+                row = self._conn.execute("SELECT COUNT(*) AS n FROM runs").fetchone()
             return int(row["n"]) if row else 0
 
     def delete_run(self, run_id: str) -> bool:
@@ -182,6 +235,14 @@ class Database:
             return False
         self._execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
         return True
+
+    def list_runs_older_than(self, older_than_days: int) -> list[DeletedRunInfo]:
+        """Return runs older than `older_than_days` days without deleting them."""
+        rows = self._fetchall(
+            "SELECT run_id, notebook_path FROM runs WHERE created_at < datetime('now', ?)",
+            (f"-{older_than_days} days",),
+        )
+        return [DeletedRunInfo(run_id=r["run_id"], notebook_path=r["notebook_path"]) for r in rows]
 
     def delete_runs_older_than(self, days: int) -> list[DeletedRunInfo]:
         """Delete runs older than `days` days. Returns deleted rows (run_id, notebook_path)."""
@@ -238,3 +299,13 @@ class Database:
         return self._fetchall(
             "SELECT * FROM pending_approvals ORDER BY created_at DESC"
         )
+
+    def purge_expired_approvals(self) -> int:
+        """Delete all rows where expires_at < now. Returns count deleted."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM pending_approvals WHERE expires_at < ?",
+                (datetime.now(timezone.utc).isoformat(),)
+            )
+            self._conn.commit()
+            return cur.rowcount

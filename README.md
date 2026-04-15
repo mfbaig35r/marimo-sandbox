@@ -49,7 +49,7 @@ claude mcp add marimo-sandbox \
   -- python -m marimo_sandbox
 ```
 
-## Tools
+## Tools (17)
 
 ### `run_python`
 
@@ -172,6 +172,51 @@ port     Local port for the editor (default 2718)
 
 Returns a `url` to open in your browser. You can then edit cells and re-run them.
 
+### `cancel_run`
+
+Cancel a run that is currently executing (`async_mode=True`). Sends SIGTERM to the
+process and marks the run as `cancelled` in the database.
+
+```
+run_id   The run to cancel (must have status 'running')
+```
+
+Returns `success`, `run_id`, `pid` — or `error` if the run is not found or not running.
+
+### `list_environments`
+
+List cached virtual environments (hash-based venv cache).
+
+Each environment corresponds to a unique set of packages. Environments are reused
+automatically when `run_python` is called with the same package list.
+
+Returns `count` and `environments` — each entry has `env_hash`, `packages`,
+`size_bytes`, `created_at`, `last_used_at`.
+
+### `clean_environments`
+
+Delete cached virtual environments that haven't been used recently.
+
+```
+older_than_days   Delete envs whose last_used_at is older than this many days (default 90)
+```
+
+Returns `deleted_count`, `deleted_hashes`, `freed_bytes`.
+
+### `diff_runs`
+
+Compare two runs and explain what changed between them. By default compares `run_id`
+against its parent run; supply `compare_to` to choose an explicit reference.
+
+```
+run_id      The run to inspect (the "after" run)
+compare_to  ID of the reference run (the "before" run); defaults to run_id's parent
+```
+
+Returns `run_a`, `run_b`, `relationship` (`parent_child` / `siblings` / `unrelated`),
+`summary` flags, `code_diff` (including `diff_text`), `env_diff`, `artifact_diff`,
+`output_diff`, `duration_diff`, and a plain-English `explanation`.
+
 ### `list_runs`
 
 List recent runs with status, description, and timestamp.
@@ -179,11 +224,15 @@ List recent runs with status, description, and timestamp.
 ```
 limit    Max results (default 20)
 status   Filter: 'success', 'error', or 'pending'
+offset   Number of runs to skip for pagination (default 0)
 ```
+
+Returns `total`, `count`, `offset`, and `runs`.
 
 ### `get_run`
 
-Full details of a specific run.
+Full details of a specific run, including the four provenance fields stored per run:
+`code_hash`, `env_hash`, `freeze`, and `risk_findings`.
 
 ```
 run_id                   Run to look up
@@ -207,9 +256,11 @@ Bulk-delete runs older than N days to reclaim disk space.
 ```
 older_than_days   Delete runs older than this many days (default 30)
 delete_files      Also remove notebook directories (default True)
+dry_run           Preview what would be deleted without deleting (default False)
 ```
 
-Returns `deleted_runs`, `files_deleted`, and `run_ids`.
+When `dry_run=False` returns `deleted_runs`, `files_deleted`, `run_ids`.
+When `dry_run=True` returns `dry_run=True`, `would_delete_runs`, `run_ids`.
 
 ### `check_setup`
 

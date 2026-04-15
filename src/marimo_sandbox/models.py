@@ -6,9 +6,11 @@ from pydantic import BaseModel, model_validator
 
 
 class RunStatus(StrEnum):
-    PENDING = "pending"
-    SUCCESS = "success"
-    ERROR = "error"
+    PENDING   = "pending"
+    RUNNING   = "running"
+    SUCCESS   = "success"
+    ERROR     = "error"
+    CANCELLED = "cancelled"
 
 
 class ArtifactInfo(BaseModel):
@@ -32,6 +34,10 @@ class RunRecord(BaseModel):
     code_hash: str | None = None
     freeze: str | None = None       # full pip freeze text; only set when packages installed
     artifacts: list[str] = []       # relative paths of user-created files
+    parent_run_id: str | None = None
+    pid: int | None = None
+    env_hash: str | None = None
+    risk_findings: list[dict] = []
 
     @model_validator(mode="before")
     @classmethod
@@ -41,6 +47,8 @@ class RunRecord(BaseModel):
             data["packages"] = json.loads(data["packages"] or "[]")
         if isinstance(data.get("artifacts"), str):
             data["artifacts"] = json.loads(data["artifacts"] or "[]")
+        if isinstance(data.get("risk_findings"), str):
+            data["risk_findings"] = json.loads(data["risk_findings"] or "[]")
         return data
 
 

@@ -1,5 +1,101 @@
 # Changelog
 
+## [1.0.0] - 2026-04-15
+
+### Added
+- `offset` parameter on `list_runs` tool — enables cursor-style pagination through run history
+- `total` and `offset` fields in `list_runs` response
+- `count_runs(status=...)` — optional status filter for accurate totals when paginating
+  with a status filter
+- `list_runs_older_than(older_than_days)` on `Database` — read-only preview query for
+  dry-run purge support
+- `dry_run=True` on `purge_runs` tool — returns `would_delete_runs` and `run_ids` preview
+  without performing any deletions
+- `diff_text` field in `code_diff` within `diff_runs` response — full unified-diff text
+  when code changed; `None` when unchanged; truncated to 8 000 characters if very large
+
+### Changed
+- `list_runs` and `get_run` implementations extracted to `_impl_list_runs` / `_impl_get_run`
+  — consistent with all other tools, enables direct unit testing without FastMCP wrapper
+- README updated to document all 17 tools (previously documented 13)
+- `purge_runs` docstring updated to include `dry_run` parameter
+
+## [0.9.2] - 2026-04-15
+
+### Fixed
+- `env_manager.py`: `_load_meta` return type changed from `dict` to `dict[str, Any]` —
+  resolves `no-any-return` mypy error; no behaviour change
+
+### Added
+- `get_run()` response now includes four provenance fields that were stored in the DB but
+  never surfaced: `code_hash`, `env_hash`, `freeze`, and `risk_findings`
+- `risk_findings` field added to `RunRecord` Pydantic model with JSON deserialisation
+  (same pattern as `packages` / `artifacts`)
+- `typecheck` job added to CI — runs `mypy src/marimo_sandbox/ --ignore-missing-imports`
+  on Python 3.11 after every push/PR
+
+## [0.9.1] - 2026-04-15
+
+### Added
+- `diff_runs(run_id, compare_to=None)` tool — compare two runs and explain what changed:
+  - Auto-resolves reference to `parent_run_id` when `compare_to` is omitted
+  - Compares code (SHA-256 hash + unified-diff line counts), environment (hash + package
+    set diff), status, artifacts (set diff), and structured `__outputs__` (shallow key diff)
+  - Duration change flagged when delta exceeds 20% of reference run time
+  - Classifies the relationship between runs: `parent_child`, `siblings`, or `unrelated`
+  - Returns a plain-English `explanation` string summarising all changes
+- `_build_explanation()` internal helper — pure function; no DB or filesystem access
+- `import difflib` — stdlib; used for `unified_diff` line counting
+
+## [0.9.0] - 2026-04-15
+
+### Added
+- `env_manager.py` — `EnvManager` class with hash-based venv cache:
+  - `env_hash(packages)` — deterministic 16-char SHA-256 hash of sorted package list
+  - `get_or_create(packages)` — cache hit reuses existing venv; cache miss creates one,
+    installs packages, writes `freeze.txt` and `meta.json`
+  - `list_envs()`, `delete_env()`, `clean_old_envs(days)` helpers
+- `EnvInfo` dataclass — env_hash, python_path, packages, freeze, created_at,
+  last_used_at, size_bytes
+- `env_hash` column on `runs` table — links each run to its venv
+- `list_environments()` tool — list cached venvs (16th MCP tool)
+- `clean_environments(older_than_days=90)` tool — delete stale venvs (16th+1 = 16 total)
+- `python_path` param on `execute()` and `execute_async()` — uses venv Python instead
+  of `sys.executable`; defaults keep all existing behaviour for no-package runs
+
+### Changed
+- `run_python` now routes package installs through `EnvManager.get_or_create()` instead
+  of `executor.install_packages()` — same packages across runs reuse an existing venv
+
+## [0.8.0] - 2026-04-15
+
+### Added
+- `RunStatus.RUNNING` and `RunStatus.CANCELLED` — two new execution states
+- `async_mode=True` on `run_python` — returns `status="running"` immediately;
+  a daemon thread watches the process and updates the DB when it finishes
+- `cancel_run(run_id)` tool — send SIGTERM to a running async process and mark
+  it `cancelled` in the DB (14th MCP tool)
+- `pid` column on `runs` table — stored immediately after async launch
+- Startup recovery in `Database.__init__` — any runs stuck in `running` from a
+  previous crashed server are reset to `error` on next open
+- `_finish_result()` helper on `NotebookExecutor` — shared logic between sync
+  and async completion paths
+- `execute_async()` on `NotebookExecutor` — launch a Popen without waiting
+
+## [0.7.0] - 2026-04-15
+
+### Added
+- `parent_run_id` column on `runs` table — `rerun` now links the new run back to its
+  origin; `get_run` exposes this field in the response
+- `purge_expired_approvals()` on `Database` — called automatically at the top of
+  `list_pending_approvals` to remove stale rows
+
+### Changed
+- `import os` no longer triggers a `high` / `dangerous_import` finding; actual dangerous
+  `os` calls (`os.system`, `os.popen`) continue to fire `critical` / `shell_execution`
+- Integration tests added to CI as a separate `integration-test` job (Python 3.12,
+  `pytest -m slow`)
+
 ## [0.6.0] - 2026-04-15
 
 ### Added
