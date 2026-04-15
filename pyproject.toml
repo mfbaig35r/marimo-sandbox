@@ -48,7 +48,7 @@ line-length = 100
 select = ["E", "F", "I"]
 
 [tool.mypy]
-python_version = "3.12"
+python_version = "3.11"
 strict = false
 disallow_untyped_defs = true
 warn_return_any = true

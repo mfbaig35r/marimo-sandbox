@@ -378,6 +378,8 @@ def _build_explanation(
             f"The code changed ({code_diff['lines_added']} line(s) added, "
             f"{code_diff['lines_removed']} removed)."
         )
+        if code_diff.get("diff_text"):
+            parts.append(f"Diff:\n{code_diff['diff_text']}")
     else:
         parts.append("The code did not change.")
     if summary["env_changed"]:
