@@ -3,9 +3,9 @@ Marimo notebook generator for marimo-sandbox.
 
 Cell model rules enforced here:
   - Cells communicate via return values, never via mutation of shared state.
-  - __execution__ returns a sentinel (sandbox_executed) that __record__ declares
-    as a parameter — this creates an explicit dependency edge in the DAG so
-    __record__ only runs if __execution__ succeeded.
+  - __execution__ returns a sentinel (sandbox_executed) and __outputs__ dict
+    that __record__ declares as parameters — this creates explicit dependency
+    edges in the DAG so __record__ only runs if __execution__ succeeded.
   - User code is injected via string substitution AFTER the %%PLACEHOLDER%%
     markers are resolved, so user code is never processed by any template engine
     (avoids {{ }} / {% %} conflicts with Jinja2-style syntax in user code).
@@ -60,18 +60,17 @@ def __context__(mo):
 
 @app.cell
 def __execution__():
-    # ── USER CODE ──────────────────────────────────────────────────────────────
+    __outputs__: dict = {}
+    # ── USER CODE ─────────────────────────────────────────────────────────────
     # __SANDBOX_USER_CODE__
-    # ── END USER CODE ──────────────────────────────────────────────────────────
+    # ── END USER CODE ─────────────────────────────────────────────────────────
 
-    # Sentinel exported to global scope (no _ prefix) so __record__ can depend
-    # on it. Marimo treats _-prefixed names as cell-local and never exports them.
     sandbox_executed = True
-    return (sandbox_executed,)
+    return (sandbox_executed, __outputs__)
 
 
 @app.cell
-def __record__(sandbox_executed, mo):
+def __record__(sandbox_executed, __outputs__, mo):
     import json as _json
     import os as _os
     import pathlib as _pathlib
@@ -79,10 +78,12 @@ def __record__(sandbox_executed, mo):
 
     _ = sandbox_executed  # dependency anchor
 
+    _outputs = __outputs__ if isinstance(__outputs__, dict) else {}
     _result = {
         "run_id": "%%RUN_ID%%",
         "status": "success",
         "executed_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "outputs": _outputs,
     }
     _nb_dir = (
         _pathlib.Path(_os.path.abspath(__file__)).parent

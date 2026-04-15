@@ -97,3 +97,30 @@ def test_has_top_level_return_false() -> None:
 def test_has_top_level_return_syntax_error() -> None:
     # Should not raise; returns False on unparsable code
     assert _has_top_level_return("def(:\n    return") is False
+
+
+# ── v0.5 additions ────────────────────────────────────────────────────────────
+
+
+def test_outputs_dict_initialized(gen: NotebookGenerator) -> None:
+    """Generated source must initialize __outputs__ as an empty dict."""
+    nb = gen.generate("run_out", "Outputs test", "pass")
+    assert "__outputs__: dict = {}" in nb.content
+
+
+def test_outputs_exported(gen: NotebookGenerator) -> None:
+    """__execution__ cell must return __outputs__ alongside sandbox_executed."""
+    nb = gen.generate("run_export", "Export test", "pass")
+    assert "return (sandbox_executed, __outputs__)" in nb.content
+
+
+def test_record_cell_accepts_outputs_param(gen: NotebookGenerator) -> None:
+    """__record__ cell must declare __outputs__ as a parameter."""
+    nb = gen.generate("run_rec", "Record test", "pass")
+    assert "__record__(sandbox_executed, __outputs__, mo)" in nb.content
+
+
+def test_record_cell_writes_outputs(gen: NotebookGenerator) -> None:
+    """Generated source must include outputs field in the result dict."""
+    nb = gen.generate("run_recout", "Record outputs test", "pass")
+    assert '"outputs": _outputs' in nb.content

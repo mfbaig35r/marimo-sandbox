@@ -75,20 +75,49 @@ def test_install_packages_empty(executor: NotebookExecutor) -> None:
         mock_run.assert_not_called()
     assert result["success"] is True
     assert result["output"] == ""
+    assert result["freeze"] == ""
+
+
+def test_install_packages_empty_returns_empty_freeze(executor: NotebookExecutor) -> None:
+    result = executor.install_packages([])
+    assert "freeze" in result
+    assert result["freeze"] == ""
 
 
 def test_install_packages_uv_success(executor: NotebookExecutor) -> None:
-    mock_result = MagicMock()
-    mock_result.returncode = 0
-    mock_result.stdout = "Successfully installed requests"
-    with patch("subprocess.run", return_value=mock_result) as mock_run:
+    install_result = MagicMock()
+    install_result.returncode = 0
+    install_result.stdout = "Successfully installed requests"
+
+    freeze_result = MagicMock()
+    freeze_result.returncode = 0
+    freeze_result.stdout = "requests==2.31.0\n"
+
+    with patch("subprocess.run", side_effect=[install_result, freeze_result]) as mock_run:
         result = executor.install_packages(["requests"])
-        # Only one call — uv succeeded, pip should not be called
-        assert mock_run.call_count == 1
-        called_cmd = mock_run.call_args[0][0]
-        assert called_cmd[0] == "uv"
+        # Two calls: uv install + pip freeze
+        assert mock_run.call_count == 2
+        first_cmd = mock_run.call_args_list[0][0][0]
+        assert first_cmd[0] == "uv"
     assert result["success"] is True
     assert "Successfully installed" in result["output"]
+    assert "requests==2.31.0" in result["freeze"]
+
+
+def test_install_packages_returns_freeze_key(executor: NotebookExecutor) -> None:
+    install_result = MagicMock()
+    install_result.returncode = 0
+    install_result.stdout = "ok"
+
+    freeze_result = MagicMock()
+    freeze_result.returncode = 0
+    freeze_result.stdout = "numpy==1.26.0\n"
+
+    with patch("subprocess.run", side_effect=[install_result, freeze_result]):
+        result = executor.install_packages(["numpy"])
+
+    assert "freeze" in result
+    assert result["freeze"] == "numpy==1.26.0\n"
 
 
 def test_install_packages_uv_missing_falls_back_to_pip(executor: NotebookExecutor) -> None:
@@ -96,15 +125,23 @@ def test_install_packages_uv_missing_falls_back_to_pip(executor: NotebookExecuto
     pip_result.returncode = 0
     pip_result.stdout = "Successfully installed requests"
 
+    freeze_result = MagicMock()
+    freeze_result.returncode = 0
+    freeze_result.stdout = "requests==2.31.0\n"
+
     def side_effect(cmd, **kwargs):
         if cmd[0] == "uv":
             raise FileNotFoundError("uv not found")
+        if cmd[1] == "freeze" or (len(cmd) > 2 and cmd[2] == "freeze"):
+            return freeze_result
         return pip_result
 
     with patch("subprocess.run", side_effect=side_effect) as mock_run:
         result = executor.install_packages(["requests"])
-        assert mock_run.call_count == 2
+        # 3 calls: uv (FileNotFoundError) + pip install + pip freeze
+        assert mock_run.call_count == 3
     assert result["success"] is True
+    assert "freeze" in result
 
 
 def test_install_packages_both_fail(executor: NotebookExecutor) -> None:
@@ -125,3 +162,4 @@ def test_install_packages_both_fail(executor: NotebookExecutor) -> None:
         result = executor.install_packages(["nonexistent-pkg-xyz"])
     assert result["success"] is False
     assert result["output"]  # some error message present
+    assert result["freeze"] == ""

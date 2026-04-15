@@ -25,6 +25,21 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 """
 
+_PENDING_APPROVALS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS pending_approvals (
+    token           TEXT PRIMARY KEY,
+    run_id          TEXT NOT NULL,
+    code            TEXT NOT NULL,
+    description     TEXT NOT NULL,
+    packages        TEXT DEFAULT '[]',
+    timeout_seconds INTEGER DEFAULT 60,
+    sandbox         INTEGER DEFAULT 0,
+    risk_findings   TEXT NOT NULL,
+    created_at      TEXT DEFAULT CURRENT_TIMESTAMP,
+    expires_at      TEXT NOT NULL
+);
+"""
+
 
 class Database:
     def __init__(self, path: Path) -> None:
@@ -34,10 +49,31 @@ class Database:
         self._lock = threading.Lock()
         with self._lock:
             self._conn.execute(_SCHEMA)
+            self._conn.execute(_PENDING_APPROVALS_SCHEMA)
             self._conn.commit()
+            # v0.3 migration: packages column
             try:
                 self._conn.execute(
                     "ALTER TABLE runs ADD COLUMN packages TEXT NOT NULL DEFAULT '[]'"
+                )
+                self._conn.commit()
+            except sqlite3.OperationalError:
+                pass  # column already exists
+            # v0.5 migration: code_hash, freeze, artifacts columns
+            for col_ddl in [
+                "ALTER TABLE runs ADD COLUMN code_hash TEXT",
+                "ALTER TABLE runs ADD COLUMN freeze TEXT DEFAULT ''",
+                "ALTER TABLE runs ADD COLUMN artifacts TEXT DEFAULT '[]'",
+            ]:
+                try:
+                    self._conn.execute(col_ddl)
+                    self._conn.commit()
+                except sqlite3.OperationalError:
+                    pass  # column already exists
+            # v0.6 migration: risk_findings column
+            try:
+                self._conn.execute(
+                    "ALTER TABLE runs ADD COLUMN risk_findings TEXT DEFAULT '[]'"
                 )
                 self._conn.commit()
             except sqlite3.OperationalError:
@@ -47,7 +83,8 @@ class Database:
 
     @staticmethod
     def _parse_run(row: dict) -> RunRecord:
-        return RunRecord.model_validate(dict(row))
+        result: RunRecord = RunRecord.model_validate(dict(row))
+        return result
 
     def _fetchone(self, sql: str, params: tuple = ()) -> dict | None:
         with self._lock:
@@ -74,11 +111,13 @@ class Database:
         code: str,
         notebook_path: str,
         packages: list[str] | None = None,
+        code_hash: str | None = None,
     ) -> None:
         self._execute(
-            "INSERT INTO runs (run_id, description, code, status, notebook_path, packages) "
-            "VALUES (?, ?, ?, 'pending', ?, ?)",
-            (run_id, description, code, notebook_path, json.dumps(packages or [])),
+            "INSERT INTO runs "
+            "(run_id, description, code, status, notebook_path, packages, code_hash) "
+            "VALUES (?, ?, ?, 'pending', ?, ?, ?)",
+            (run_id, description, code, notebook_path, json.dumps(packages or []), code_hash),
         )
 
     def update_run(
@@ -89,14 +128,22 @@ class Database:
         stdout: str | None = None,
         stderr: str | None = None,
         error: str | None = None,
+        freeze: str | None = None,
+        artifacts: list[str] | None = None,
+        risk_findings: list[dict] | None = None,
     ) -> None:
         self._execute(
-            """
-            UPDATE runs
-            SET status = ?, duration_ms = ?, stdout = ?, stderr = ?, error = ?
-            WHERE run_id = ?
-            """,
-            (status, duration_ms, stdout, stderr, error, run_id),
+            """UPDATE runs
+               SET status=?, duration_ms=?, stdout=?, stderr=?, error=?,
+                   freeze=?, artifacts=?, risk_findings=?
+               WHERE run_id=?""",
+            (
+                status, duration_ms, stdout, stderr, error,
+                freeze,
+                json.dumps(artifacts or []),
+                json.dumps(risk_findings or []),
+                run_id,
+            ),
         )
 
     def get_run(self, run_id: str) -> RunRecord | None:
@@ -149,3 +196,45 @@ class Database:
                 tuple(r["run_id"] for r in rows),
             )
         return [DeletedRunInfo(run_id=r["run_id"], notebook_path=r["notebook_path"]) for r in rows]
+
+    # ── Pending approvals ────────────────────────────────────────────────────
+
+    def create_pending_approval(
+        self,
+        token: str,
+        run_id: str,
+        code: str,
+        description: str,
+        packages: list[str],
+        timeout_seconds: int,
+        sandbox: bool,
+        risk_findings_json: str,
+        expires_at: str,
+    ) -> None:
+        self._execute(
+            """INSERT INTO pending_approvals
+               (token, run_id, code, description, packages, timeout_seconds,
+                sandbox, risk_findings, expires_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                token, run_id, code, description,
+                json.dumps(packages or []),
+                timeout_seconds,
+                1 if sandbox else 0,
+                risk_findings_json,
+                expires_at,
+            ),
+        )
+
+    def get_pending_approval(self, token: str) -> dict | None:
+        return self._fetchone(
+            "SELECT * FROM pending_approvals WHERE token = ?", (token,)
+        )
+
+    def delete_pending_approval(self, token: str) -> None:
+        self._execute("DELETE FROM pending_approvals WHERE token = ?", (token,))
+
+    def list_pending_approvals(self) -> list[dict]:
+        return self._fetchall(
+            "SELECT * FROM pending_approvals ORDER BY created_at DESC"
+        )

@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.6.0] - 2026-04-15
+
+### Added
+- `analyzer.py` — `StaticRiskAnalyzer` (AST-based) detects critical/high/medium/low risk
+  patterns: subprocess calls, shell execution, dynamic code eval, dangerous imports,
+  file writes, env reads
+- `dry_run=True` on `run_python` — returns risk analysis without executing code
+- `require_approval=True` on `run_python` — blocks runs with critical findings and
+  issues an approval token; execution proceeds via `approve_run(token)`
+- `approve_run` tool — confirm a blocked run and execute it (tokens expire in 1 hour)
+- `list_pending_approvals` tool — list runs awaiting confirmation
+- `pending_approvals` SQLite table — stores blocked runs with TTL expiry
+- `risk_findings` column on `runs` table — advisory findings persisted per run
+- `risk_findings` field in `run_python` response (when findings exist)
+
+## [0.5.0] - 2026-04-15
+
+### Added
+- `ArtifactInfo` model — typed descriptor for user-created files (path, size, extension)
+- `code_hash` (SHA-256) computed per run and stored in DB + returned in response
+- `freeze` — full `pip freeze` snapshot captured after package installation
+- `artifacts` — list of user-created files detected after execution
+- `__outputs__: dict` initialized in `__execution__` cell and written to result sidecar
+- `list_artifacts` tool — list files created by a run's code
+- `read_artifact` tool — read text or binary artifact content (path-traversal safe)
+- `get_run_outputs` tool — retrieve the structured `__outputs__` dict from a run
+- Three new columns migrated automatically: `code_hash`, `freeze`, `artifacts`
+
 ## [0.4.0] - 2026-04-15
 
 ### Added

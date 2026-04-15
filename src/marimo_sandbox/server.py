@@ -3,16 +3,29 @@ marimo-sandbox FastMCP server.
 
 Tools
 -----
-run_python          Execute Python code; returns stdout/stderr and a notebook path.
-open_notebook       Launch marimo edit for interactive viewing of a run.
-list_runs           List recent runs with status and description.
-get_run             Full details of a specific run, including code and output.
-check_setup         Verify marimo and Docker availability.
+run_python              Execute Python code; returns stdout/stderr and a notebook path.
+open_notebook           Launch marimo edit for interactive viewing of a run.
+list_runs               List recent runs with status and description.
+get_run                 Full details of a specific run, including code and output.
+check_setup             Verify marimo and Docker availability.
+delete_run              Remove a run's record and notebook files.
+rerun                   Re-execute a previous run's code.
+purge_runs              Bulk-delete runs older than N days.
+list_artifacts          List user-created files in a run's notebook directory.
+read_artifact           Read the content of an artifact file.
+get_run_outputs         Retrieve the structured __outputs__ dict from a run.
+approve_run             Confirm a blocked run and execute it.
+list_pending_approvals  List runs awaiting approval.
 """
 
+import base64
+import hashlib
+import json
+import mimetypes
 import os
 import secrets
 import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastmcp import FastMCP
@@ -55,9 +68,26 @@ mcp = FastMCP(
         "Use list_runs and get_run to inspect history. "
         "Use rerun to re-execute a previous run's code by run_id. "
         "Use delete_run to remove a run's record and files. "
-        "Use purge_runs to bulk-delete runs older than N days."
+        "Use purge_runs to bulk-delete runs older than N days. "
+        "Use list_artifacts / read_artifact to inspect files created by a run. "
+        "Use get_run_outputs to read the structured __outputs__ dict. "
+        "Use dry_run=True on run_python for static risk analysis without execution. "
+        "Use require_approval=True to block runs with critical risk findings."
     ),
 )
+
+
+# ── Private helpers ────────────────────────────────────────────────────────────
+
+
+def _scan_artifacts(notebook_dir: Path, run_id: str) -> list[str]:
+    """Return relative paths of user-created files in notebook_dir."""
+    exclude = {"notebook.py", f"{run_id}_result.json"}
+    return sorted(
+        str(item.relative_to(notebook_dir))
+        for item in notebook_dir.rglob("*")
+        if item.is_file() and item.name not in exclude
+    )
 
 
 # ── Implementations ───────────────────────────────────────────────────────────
@@ -69,15 +99,75 @@ def _impl_run_python(
     timeout_seconds: int,
     sandbox: bool,
     packages: list[str] | None,
+    dry_run: bool = False,
+    require_approval: bool = False,
 ) -> dict:
     if packages is None:
         packages = []
     # Normalise line endings and strip BOM
     code = code.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
 
+    # ── Static risk analysis ─────────────────────────────────────────────────
+    from .analyzer import StaticRiskAnalyzer
+
+    findings = StaticRiskAnalyzer(code).analyze()
+    findings_dicts = [
+        {
+            "severity": f.severity,
+            "category": f.category,
+            "line": f.line,
+            "message": f.message,
+            "code_snippet": f.code_snippet,
+        }
+        for f in findings
+    ]
+
+    # dry_run: return analysis only, no execution
+    if dry_run:
+        critical = [f for f in findings if f.severity == "critical"]
+        return {
+            "status": "analysis_complete",
+            "dry_run": True,
+            "risk_findings": findings_dicts,
+            "requires_confirmation": bool(critical),
+            "finding_count": {
+                s: sum(1 for f in findings if f.severity == s)
+                for s in ("critical", "high", "medium", "low")
+            },
+        }
+
+    # approval gate: block on critical findings if require_approval=True
+    critical = [f for f in findings if f.severity == "critical"]
+    if require_approval and critical:
+        token = "approval_" + secrets.token_hex(16)
+        run_id = "run_" + secrets.token_hex(4)
+        expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        db.create_pending_approval(
+            token=token,
+            run_id=run_id,
+            code=code,
+            description=description,
+            packages=packages,
+            timeout_seconds=timeout_seconds,
+            sandbox=sandbox,
+            risk_findings_json=json.dumps(findings_dicts),
+            expires_at=expires_at,
+        )
+        return {
+            "status": "awaiting_confirmation",
+            "run_id": run_id,
+            "approval_token": token,
+            "expires_at": expires_at,
+            "critical_findings": [d for d in findings_dicts if d["severity"] == "critical"],
+            "message": "Call approve_run(approval_token) to execute.",
+        }
+
+    # ── Normal execution ─────────────────────────────────────────────────────
+    code_hash = hashlib.sha256(code.encode()).hexdigest()
     run_id = "run_" + secrets.token_hex(4)
 
     # Install packages before generating/executing
+    freeze: str | None = None
     if packages:
         install_result = executor.install_packages(packages)
         if not install_result["success"]:
@@ -91,6 +181,7 @@ def _impl_run_python(
                 "notebook_path": None,
                 "view_command": None,
             }
+        freeze = install_result.get("freeze") or None
 
     # Generate notebook
     try:
@@ -118,6 +209,7 @@ def _impl_run_python(
         code=code,
         notebook_path=str(notebook.notebook_path),
         packages=packages,
+        code_hash=code_hash,
     )
 
     # Execute
@@ -127,6 +219,9 @@ def _impl_run_python(
         sandbox=sandbox,
     )
 
+    # Scan for user-created artifact files
+    artifacts = _scan_artifacts(notebook.notebook_dir, run_id)
+
     # Update record with outcome
     db.update_run(
         run_id=run_id,
@@ -135,9 +230,12 @@ def _impl_run_python(
         stdout=result.stdout,
         stderr=result.stderr,
         error=result.error,
+        freeze=freeze,
+        artifacts=artifacts or None,
+        risk_findings=findings_dicts or None,
     )
 
-    response = {
+    response: dict = {
         "run_id": run_id,
         "status": result.status,
         "stdout": result.stdout or "",
@@ -146,9 +244,15 @@ def _impl_run_python(
         "duration_ms": result.duration_ms,
         "notebook_path": str(notebook.notebook_path),
         "view_command": f'marimo edit "{notebook.notebook_path}"',
+        "code_hash": code_hash,
+        "artifacts": artifacts,
     }
     if packages:
         response["packages_installed"] = packages
+    if freeze:
+        response["freeze"] = freeze
+    if findings:
+        response["risk_findings"] = findings_dicts
     return response
 
 
@@ -214,6 +318,131 @@ def _impl_purge_runs(older_than_days: int, delete_files: bool) -> dict:
     }
 
 
+def _impl_list_artifacts(run_id: str) -> dict:
+    run = db.get_run(run_id)
+    if not run:
+        return {"error": f"Run not found: {run_id}"}
+    notebook_dir = Path(run.notebook_path).parent
+    artifact_paths = _scan_artifacts(notebook_dir, run_id)
+    artifact_infos = []
+    for rel_path in artifact_paths:
+        full_path = notebook_dir / rel_path
+        stat = full_path.stat()
+        artifact_infos.append(
+            {
+                "path": rel_path,
+                "size_bytes": stat.st_size,
+                "extension": Path(rel_path).suffix,
+            }
+        )
+    return {
+        "run_id": run_id,
+        "artifact_count": len(artifact_infos),
+        "artifacts": artifact_infos,
+    }
+
+
+def _impl_read_artifact(
+    run_id: str,
+    artifact_path: str,
+    max_size_bytes: int = 5_000_000,
+) -> dict:
+    run = db.get_run(run_id)
+    if not run:
+        return {"error": f"Run not found: {run_id}"}
+    notebook_dir = Path(run.notebook_path).parent.resolve()
+    full_path = (notebook_dir / artifact_path).resolve()
+    # Reject path traversal
+    try:
+        full_path.relative_to(notebook_dir)
+    except ValueError:
+        return {"error": f"Path traversal detected: {artifact_path}"}
+    if not full_path.exists():
+        return {"error": f"Artifact not found: {artifact_path}"}
+    size_bytes = full_path.stat().st_size
+    if size_bytes > max_size_bytes:
+        return {
+            "error": f"Artifact too large: {size_bytes} bytes (max {max_size_bytes})"
+        }
+    media_type, _ = mimetypes.guess_type(str(full_path))
+    is_text = media_type is not None and (
+        media_type.startswith("text/") or media_type == "application/json"
+    )
+    if is_text:
+        return {
+            "content": full_path.read_text(errors="replace"),
+            "media_type": media_type,
+            "size_bytes": size_bytes,
+            "is_text": True,
+        }
+    return {
+        "content_base64": base64.b64encode(full_path.read_bytes()).decode(),
+        "media_type": media_type,
+        "size_bytes": size_bytes,
+        "is_text": False,
+    }
+
+
+def _impl_get_run_outputs(run_id: str) -> dict:
+    run = db.get_run(run_id)
+    if not run:
+        return {"error": f"Run not found: {run_id}"}
+    notebook_dir = Path(run.notebook_path).parent
+    result_path = notebook_dir / f"{run_id}_result.json"
+    if not result_path.exists():
+        return {"run_id": run_id, "status": "no_result", "outputs": {}}
+    try:
+        data = json.loads(result_path.read_text())
+        return {
+            "run_id": run_id,
+            "status": data.get("status"),
+            "outputs": data.get("outputs", {}),
+        }
+    except (json.JSONDecodeError, OSError):
+        return {"run_id": run_id, "status": "error", "outputs": {}}
+
+
+def _impl_approve_run(token: str, reason: str = "") -> dict:
+    row = db.get_pending_approval(token)
+    if not row:
+        return {"error": f"Invalid or unknown approval token: {token}"}
+    if datetime.now(timezone.utc).isoformat() > row["expires_at"]:
+        db.delete_pending_approval(token)
+        return {"error": "Approval token has expired (1-hour limit)."}
+    db.delete_pending_approval(token)
+    return _impl_run_python(
+        code=row["code"],
+        description=row["description"],
+        timeout_seconds=row["timeout_seconds"],
+        sandbox=bool(row["sandbox"]),
+        packages=json.loads(row["packages"]),
+        dry_run=False,
+        require_approval=False,  # already approved; skip gate
+    )
+
+
+def _impl_list_pending_approvals() -> dict:
+    rows = db.list_pending_approvals()
+    now = datetime.now(timezone.utc).isoformat()
+    pending = [
+        {
+            "run_id": r["run_id"],
+            "approval_token": r["token"],
+            "description": r["description"],
+            "created_at": r["created_at"],
+            "expires_at": r["expires_at"],
+            "expired": r["expires_at"] < now,
+            "critical_finding_count": sum(
+                1
+                for f in json.loads(r["risk_findings"])
+                if f["severity"] == "critical"
+            ),
+        }
+        for r in rows
+    ]
+    return {"count": len(pending), "pending": pending}
+
+
 # ── Tools ─────────────────────────────────────────────────────────────────────
 
 
@@ -224,6 +453,8 @@ def run_python(
     timeout_seconds: int = 60,
     sandbox: bool = False,
     packages: list[str] | None = None,
+    dry_run: bool = False,
+    require_approval: bool = False,
 ) -> dict:
     """
     Execute Python code in a Marimo notebook.
@@ -245,12 +476,19 @@ def run_python(
         sandbox:          Run inside Docker with --network=none and resource
                           limits (requires Docker). Default False.
         packages:         PyPI packages to install before running (via uv, fallback pip).
+        dry_run:          If True, return static risk analysis only — do not execute.
+        require_approval: If True, block execution when critical risk patterns are found
+                          and return an approval_token to confirm via approve_run().
 
     Returns:
         run_id, status, stdout, stderr, error, duration_ms,
-        notebook_path, view_command, packages_installed (if any).
+        notebook_path, view_command, code_hash, artifacts,
+        risk_findings (if any), packages_installed (if any), freeze (if any).
     """
-    return _impl_run_python(code, description, timeout_seconds, sandbox, packages)
+    return _impl_run_python(
+        code, description, timeout_seconds, sandbox, packages,
+        dry_run=dry_run, require_approval=require_approval,
+    )
 
 
 @mcp.tool()
@@ -450,6 +688,97 @@ def purge_runs(older_than_days: int = 30, delete_files: bool = True) -> dict:
         deleted_runs, files_deleted, run_ids.
     """
     return _impl_purge_runs(older_than_days, delete_files)
+
+
+@mcp.tool()
+def list_artifacts(run_id: str) -> dict:
+    """
+    List user-created files in a run's notebook directory.
+
+    Returns every file except the generated notebook.py and the result sidecar JSON.
+    These are files your code wrote to disk during execution (e.g. CSVs, images, reports).
+
+    Args:
+        run_id:  The run to inspect.
+
+    Returns:
+        run_id, artifact_count, artifacts — each entry has path, size_bytes, extension.
+    """
+    return _impl_list_artifacts(run_id)
+
+
+@mcp.tool()
+def read_artifact(
+    run_id: str,
+    artifact_path: str,
+    max_size_bytes: int = 5_000_000,
+) -> dict:
+    """
+    Read the content of an artifact file created by a run.
+
+    Args:
+        run_id:         The run that created the file.
+        artifact_path:  Relative path within the run's directory (from list_artifacts).
+        max_size_bytes: Size limit in bytes (default 5 MB). Files larger than this
+                        are rejected to prevent memory issues.
+
+    Returns:
+        For text files: content (str), media_type, size_bytes, is_text=True.
+        For binary files: content_base64 (str), media_type, size_bytes, is_text=False.
+    """
+    return _impl_read_artifact(run_id, artifact_path, max_size_bytes)
+
+
+@mcp.tool()
+def get_run_outputs(run_id: str) -> dict:
+    """
+    Retrieve the structured __outputs__ dict written by the run.
+
+    Runs can expose typed data to agents by populating the `__outputs__` dict
+    inside their code (e.g. `__outputs__["result"] = df.to_dict()`).
+    This tool reads the sidecar JSON to return those values directly.
+
+    Args:
+        run_id:  The run to read outputs from.
+
+    Returns:
+        run_id, status, outputs (dict). If the run hasn't completed successfully,
+        status is 'no_result' and outputs is empty.
+    """
+    return _impl_get_run_outputs(run_id)
+
+
+@mcp.tool()
+def approve_run(approval_token: str, reason: str = "") -> dict:
+    """
+    Confirm a blocked run and execute it.
+
+    When run_python is called with require_approval=True and the code contains
+    critical risk patterns, execution is blocked and an approval_token is returned.
+    Call this tool with that token to proceed with execution.
+
+    Tokens expire after 1 hour.
+
+    Args:
+        approval_token:  The token returned by run_python when status='awaiting_confirmation'.
+        reason:          Optional note explaining why you approved this run.
+
+    Returns:
+        Same as run_python on success, or error if the token is invalid/expired.
+    """
+    return _impl_approve_run(approval_token, reason)
+
+
+@mcp.tool()
+def list_pending_approvals() -> dict:
+    """
+    List all runs currently awaiting approval.
+
+    Returns:
+        count, pending — each entry has run_id, approval_token, description,
+        created_at, expires_at, expired, critical_finding_count.
+    """
+    return _impl_list_pending_approvals()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────

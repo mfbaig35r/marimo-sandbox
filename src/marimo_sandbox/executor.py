@@ -174,7 +174,8 @@ class NotebookExecutor:
         while time.monotonic() < deadline:
             # Process died immediately — capture its stderr for the error
             if process.poll() is not None:
-                stderr = process.stderr.read().decode(errors="replace")
+                raw_err = process.stderr.read() if process.stderr is not None else b""
+                stderr = raw_err.decode(errors="replace")
                 return {
                     "success": False,
                     "error": f"marimo exited immediately: {stderr[:400]}",
@@ -198,9 +199,9 @@ class NotebookExecutor:
     # ── Package installation ─────────────────────────────────────────────────
 
     def install_packages(self, packages: list[str]) -> dict:
-        """Install packages via uv (fallback: pip). Returns {success, output}."""
+        """Install packages via uv (fallback: pip). Returns {success, output, freeze}."""
         if not packages:
-            return {"success": True, "output": ""}
+            return {"success": True, "output": "", "freeze": ""}
         last_error = "no installer found"
         for cmd in [
             ["uv", "pip", "install", *packages],
@@ -209,11 +210,18 @@ class NotebookExecutor:
             try:
                 r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
                 if r.returncode == 0:
-                    return {"success": True, "output": r.stdout}
+                    freeze_r = subprocess.run(
+                        [sys.executable, "-m", "pip", "freeze"],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    freeze = freeze_r.stdout if freeze_r.returncode == 0 else ""
+                    return {"success": True, "output": r.stdout, "freeze": freeze}
                 last_error = r.stderr
             except FileNotFoundError:
                 last_error = f"{cmd[0]} not found"
-        return {"success": False, "output": last_error}
+        return {"success": False, "output": last_error, "freeze": ""}
 
     @staticmethod
     def check_uv() -> bool:

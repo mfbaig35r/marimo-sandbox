@@ -157,3 +157,159 @@ def test_delete_runs_older_than(db: Database) -> None:
     # Fresh run must survive
     assert db.get_run("run_fresh") is not None
     assert db.count_runs() == 1
+
+
+# ── v0.5 additions ────────────────────────────────────────────────────────────
+
+
+def test_create_run_stores_code_hash(db: Database) -> None:
+    db.create_run("run_hash", "Hash test", "x = 1", "/tmp/nb.py", code_hash="abc123")
+    row = db.get_run("run_hash")
+    assert row is not None
+    assert row.code_hash == "abc123"
+
+
+def test_create_run_no_code_hash(db: Database) -> None:
+    db.create_run("run_nohash", "No hash", "pass", "/tmp/nb.py")
+    row = db.get_run("run_nohash")
+    assert row is not None
+    assert row.code_hash is None
+
+
+def test_update_run_stores_freeze_and_artifacts(db: Database) -> None:
+    db.create_run("run_fa", "Freeze+artifacts", "pass", "/tmp/nb.py")
+    db.update_run(
+        "run_fa",
+        status="success",
+        duration_ms=100,
+        freeze="requests==2.31.0\nnumpy==1.26.0",
+        artifacts=["output.csv", "chart.png"],
+    )
+    row = db.get_run("run_fa")
+    assert row is not None
+    assert row.freeze == "requests==2.31.0\nnumpy==1.26.0"
+    assert row.artifacts == ["output.csv", "chart.png"]
+
+
+def test_update_run_artifacts_default_empty(db: Database) -> None:
+    db.create_run("run_noart", "No artifacts", "pass", "/tmp/nb.py")
+    db.update_run("run_noart", status="success", duration_ms=50)
+    row = db.get_run("run_noart")
+    assert row is not None
+    assert row.artifacts == []
+
+
+def test_migration_new_columns(tmp_path: Path) -> None:
+    """Legacy DB without v0.5 columns opens without error; fields default correctly."""
+    db_path = tmp_path / "legacy_v04.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute(
+        """
+        CREATE TABLE runs (
+            run_id TEXT PRIMARY KEY,
+            description TEXT NOT NULL,
+            code TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            notebook_path TEXT NOT NULL,
+            packages TEXT NOT NULL DEFAULT '[]',
+            duration_ms INTEGER,
+            stdout TEXT,
+            stderr TEXT,
+            error TEXT,
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO runs (run_id, description, code, status, notebook_path) "
+        "VALUES ('run_old', 'Old', 'pass', 'pending', '/tmp/nb.py')"
+    )
+    conn.commit()
+    conn.close()
+
+    migrated = Database(db_path)
+    row = migrated.get_run("run_old")
+    assert row is not None
+    assert row.code_hash is None
+    assert row.freeze is None or row.freeze == ""
+    assert row.artifacts == []
+
+
+# ── v0.6 additions ────────────────────────────────────────────────────────────
+
+
+def test_runs_table_has_risk_findings_column(db: Database) -> None:
+    db.create_run("run_rf", "Risk findings test", "pass", "/tmp/nb.py")
+    db.update_run(
+        "run_rf",
+        status="success",
+        duration_ms=10,
+        risk_findings=[{"severity": "high", "category": "dangerous_import",
+                        "line": 1, "message": "import os detected"}],
+    )
+    # Verify via raw SQL that the column exists and has data
+    with db._lock:
+        row = db._conn.execute(
+            "SELECT risk_findings FROM runs WHERE run_id = 'run_rf'"
+        ).fetchone()
+    assert row is not None
+    assert "dangerous_import" in row[0]
+
+
+def test_create_and_get_pending_approval(db: Database) -> None:
+    db.create_pending_approval(
+        token="approval_abc123",
+        run_id="run_001",
+        code="import subprocess; subprocess.run(['ls'])",
+        description="Test run",
+        packages=[],
+        timeout_seconds=60,
+        sandbox=False,
+        risk_findings_json='[{"severity": "critical"}]',
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    row = db.get_pending_approval("approval_abc123")
+    assert row is not None
+    assert row["token"] == "approval_abc123"
+    assert row["run_id"] == "run_001"
+    assert row["expires_at"] == "2099-01-01T00:00:00+00:00"
+    assert row["sandbox"] == 0
+
+
+def test_get_pending_approval_missing(db: Database) -> None:
+    assert db.get_pending_approval("nonexistent_token") is None
+
+
+def test_delete_pending_approval(db: Database) -> None:
+    db.create_pending_approval(
+        token="approval_del",
+        run_id="run_002",
+        code="pass",
+        description="Delete test",
+        packages=[],
+        timeout_seconds=30,
+        sandbox=False,
+        risk_findings_json="[]",
+        expires_at="2099-01-01T00:00:00+00:00",
+    )
+    db.delete_pending_approval("approval_del")
+    assert db.get_pending_approval("approval_del") is None
+
+
+def test_list_pending_approvals_returns_all(db: Database) -> None:
+    for i in range(3):
+        db.create_pending_approval(
+            token=f"approval_{i}",
+            run_id=f"run_{i:03d}",
+            code="pass",
+            description=f"Run {i}",
+            packages=[],
+            timeout_seconds=60,
+            sandbox=False,
+            risk_findings_json="[]",
+            expires_at="2099-01-01T00:00:00+00:00",
+        )
+    rows = db.list_pending_approvals()
+    assert len(rows) == 3
+    tokens = {r["token"] for r in rows}
+    assert tokens == {"approval_0", "approval_1", "approval_2"}
