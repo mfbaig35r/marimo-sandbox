@@ -31,7 +31,6 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from .generator import GeneratedNotebook
 
@@ -40,9 +39,9 @@ from .generator import GeneratedNotebook
 class ExecutionResult:
     status: str              # "success" | "error"
     duration_ms: int
-    stdout: Optional[str] = None
-    stderr: Optional[str] = None
-    error: Optional[str] = None  # human-readable error message
+    stdout: str | None = None
+    stderr: str | None = None
+    error: str | None = None  # human-readable error message
 
 
 class NotebookExecutor:

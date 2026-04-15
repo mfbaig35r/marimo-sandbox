@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "marimo-sandbox"
-version = "0.2.0"
+version = "0.4.0"
 description = "FastMCP server: run Python in auditable Marimo notebooks"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,6 +24,7 @@ classifiers = [
 dependencies = [
     "fastmcp>=2.0.0",
     "marimo>=0.10.0",
+    "pydantic>=2.0",
 ]
 
 [project.urls]
@@ -32,7 +33,7 @@ Repository = "https://github.com/mfbaig35r/marimo-sandbox"
 
 [project.optional-dependencies]
 sandbox = ["docker>=6.0"]
-dev = ["pytest>=7", "pytest-timeout", "ruff"]
+dev = ["pytest>=7", "pytest-timeout", "ruff", "mypy>=1.0"]
 
 [project.scripts]
 marimo-sandbox = "marimo_sandbox.server:main"
@@ -45,6 +46,17 @@ line-length = 100
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = false
+disallow_untyped_defs = true
+warn_return_any = true
+warn_unused_ignores = true
+
+[[tool.mypy.overrides]]
+module = ["fastmcp.*", "marimo.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
