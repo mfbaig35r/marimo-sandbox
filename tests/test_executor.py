@@ -1,11 +1,12 @@
 """Unit tests for executor helper functions."""
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from marimo_sandbox.executor import NotebookExecutor
-from marimo_sandbox.generator import _has_top_level_return, _validate_syntax
+from marimo_sandbox.generator import GeneratedNotebook, _has_top_level_return, _validate_syntax
 
 # These helpers live in generator.py but are used by the executor indirectly
 # (via NotebookGenerator.generate). Testing them here separately keeps
@@ -142,6 +143,62 @@ def test_install_packages_uv_missing_falls_back_to_pip(executor: NotebookExecuto
         assert mock_run.call_count == 3
     assert result["success"] is True
     assert "freeze" in result
+
+
+# ── _finish_result tests ──────────────────────────────────────────────────────
+
+
+def _make_nb(tmp_path: Path, run_id: str = "run_abc") -> GeneratedNotebook:
+    nb_path = tmp_path / "notebook.py"
+    nb_path.touch()
+    return GeneratedNotebook(
+        run_id=run_id, notebook_path=nb_path, notebook_dir=tmp_path, content=""
+    )
+
+
+def test_finish_result_success_with_sidecar(tmp_path: Path, executor: NotebookExecutor) -> None:
+    nb = _make_nb(tmp_path)
+    # Create the sidecar so _finish_result sees success
+    nb.result_path.touch()
+    result = executor._finish_result(nb, returncode=0, stdout="hi", stderr="", duration_ms=100)
+    assert result.status == "success"
+    assert result.stdout == "hi"
+
+
+def test_finish_result_error_no_sidecar_nonzero(tmp_path: Path, executor: NotebookExecutor) -> None:
+    nb = _make_nb(tmp_path)
+    result = executor._finish_result(
+        nb, returncode=1, stdout="", stderr="Traceback...", duration_ms=50
+    )
+    assert result.status == "error"
+    assert result.error == "Traceback..."
+
+
+def test_finish_result_error_clean_exit_no_sidecar(
+    tmp_path: Path, executor: NotebookExecutor
+) -> None:
+    nb = _make_nb(tmp_path)
+    result = executor._finish_result(nb, returncode=0, stdout="", stderr="", duration_ms=10)
+    assert result.status == "error"
+    assert result.error is not None
+    assert "sys.exit" in result.error
+
+
+# ── execute_async tests ───────────────────────────────────────────────────────
+
+
+def test_execute_async_returns_popen(tmp_path: Path, executor: NotebookExecutor) -> None:
+    nb_path = tmp_path / "notebook.py"
+    nb_path.write_text("import sys; sys.exit(0)")
+    nb = GeneratedNotebook(
+        run_id="run_abc", notebook_path=nb_path, notebook_dir=tmp_path, content=""
+    )
+    mock_process = MagicMock()
+    mock_process.pid = 1234
+    with patch("subprocess.Popen", return_value=mock_process) as mock_popen:
+        process = executor.execute_async(nb, timeout_seconds=5)
+    assert process is mock_process
+    mock_popen.assert_called_once()
 
 
 def test_install_packages_both_fail(executor: NotebookExecutor) -> None:

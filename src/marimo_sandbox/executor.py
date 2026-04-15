@@ -55,6 +55,7 @@ class NotebookExecutor:
         notebook: GeneratedNotebook,
         timeout_seconds: int = 60,
         sandbox: bool = False,
+        python_path: Path | None = None,
     ) -> ExecutionResult:
         start = time.monotonic()
 
@@ -62,7 +63,9 @@ class NotebookExecutor:
             if sandbox:
                 raw = self._run_docker(notebook.notebook_path, timeout_seconds)
             else:
-                raw = self._run_subprocess(notebook.notebook_path, timeout_seconds)
+                raw = self._run_subprocess(
+                    notebook.notebook_path, timeout_seconds, python_path=python_path
+                )
         except subprocess.TimeoutExpired:
             return ExecutionResult(
                 status="error",
@@ -77,23 +80,35 @@ class NotebookExecutor:
             )
 
         duration_ms = int((time.monotonic() - start) * 1000)
+        return self._finish_result(
+            notebook, raw.returncode, raw.stdout or "", raw.stderr or "", duration_ms
+        )
 
+    def _finish_result(
+        self,
+        notebook: GeneratedNotebook,
+        returncode: int,
+        stdout: str,
+        stderr: str,
+        duration_ms: int,
+    ) -> ExecutionResult:
+        """Determine success/error from returncode and sidecar file."""
         # Sidecar written → __execution__ and __record__ both completed
         if notebook.result_path.exists():
             return ExecutionResult(
                 status="success",
                 duration_ms=duration_ms,
-                stdout=raw.stdout or None,
-                stderr=raw.stderr or None,
+                stdout=stdout or None,
+                stderr=stderr or None,
             )
 
         # No sidecar but clean exit → likely sys.exit() in user code
-        if raw.returncode == 0:
+        if returncode == 0:
             return ExecutionResult(
                 status="error",
                 duration_ms=duration_ms,
-                stdout=raw.stdout or None,
-                stderr=raw.stderr or None,
+                stdout=stdout or None,
+                stderr=stderr or None,
                 error=(
                     "Notebook exited before writing results. "
                     "Was sys.exit() called in the code?"
@@ -101,22 +116,57 @@ class NotebookExecutor:
             )
 
         # Non-zero exit → uncaught exception; traceback is in stderr
-        stderr = (raw.stderr or "").strip()
+        stderr_stripped = stderr.strip()
         return ExecutionResult(
             status="error",
             duration_ms=duration_ms,
-            stdout=raw.stdout or None,
-            stderr=raw.stderr or None,
-            error=stderr or "Execution failed (non-zero exit, no stderr captured)",
+            stdout=stdout or None,
+            stderr=stderr or None,
+            error=stderr_stripped or "Execution failed (non-zero exit, no stderr captured)",
+        )
+
+    def execute_async(
+        self,
+        notebook: GeneratedNotebook,
+        timeout_seconds: int = 60,
+        sandbox: bool = False,
+        python_path: Path | None = None,
+    ) -> subprocess.Popen:
+        """Launch execution; return the Popen immediately (don't wait)."""
+        interpreter = str(python_path) if python_path else sys.executable
+        if sandbox:
+            notebook_dir = notebook.notebook_path.parent
+            cmd = [
+                "docker", "run",
+                "--rm",
+                "--memory=512m",
+                "--cpus=1",
+                "--network=none",
+                "--read-only",
+                "--tmpfs=/tmp:size=64m,noexec",
+                "-v", f"{notebook_dir}:/sandbox:rw",
+                "-w", "/sandbox",
+                self.docker_image,
+                "python", f"/sandbox/{notebook.notebook_path.name}",
+            ]
+        else:
+            cmd = [interpreter, str(notebook.notebook_path)]
+        return subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            cwd=str(notebook.notebook_path.parent),
         )
 
     # ── Subprocess runners ───────────────────────────────────────────────────
 
     def _run_subprocess(
-        self, notebook_path: Path, timeout: int
+        self, notebook_path: Path, timeout: int, python_path: Path | None = None
     ) -> subprocess.CompletedProcess:
+        interpreter = str(python_path) if python_path else sys.executable
         return subprocess.run(
-            [sys.executable, str(notebook_path)],
+            [interpreter, str(notebook_path)],
             capture_output=True,
             text=True,
             timeout=timeout,

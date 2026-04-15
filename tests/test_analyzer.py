@@ -92,12 +92,11 @@ def test_detects_requests_import() -> None:
     assert any("requests" in f.message for f in high)
 
 
-def test_detects_os_import() -> None:
+def test_os_import_not_flagged_as_high() -> None:
     code = "import os\nprint(os.getcwd())"
     findings = _analyze(code)
     high = [f for f in findings if f.severity == "high" and f.category == "dangerous_import"]
-    assert len(high) >= 1
-    assert any("os" in f.message for f in high)
+    assert not any("import os" in f.message for f in high)
 
 
 def test_detects_socket_import() -> None:

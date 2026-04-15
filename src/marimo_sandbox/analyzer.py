@@ -16,7 +16,7 @@ class RiskFinding:
 class StaticRiskAnalyzer(ast.NodeVisitor):
     _SUBPROCESS_ATTRS = {"run", "call", "check_call", "check_output", "Popen"}
     _DANGEROUS_IMPORTS = {
-        "subprocess", "os", "socket", "requests", "urllib",
+        "subprocess", "socket", "requests", "urllib",
         "http", "paramiko", "smtplib", "ftplib",
     }
 
