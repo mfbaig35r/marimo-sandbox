@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "marimo-sandbox"
+version = "0.1.0"
+description = "FastMCP server: run Python in auditable Marimo notebooks"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+authors = [
+    {name = "Farhan Baig", email = "mfbaig35r@gmail.com"},
+]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Intended Audience :: Developers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "fastmcp>=2.0.0",
+    "marimo>=0.10.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/mfbaig35r/marimo-sandbox"
+Repository = "https://github.com/mfbaig35r/marimo-sandbox"
+
+[project.optional-dependencies]
+sandbox = ["docker>=6.0"]
+dev = ["pytest>=7", "pytest-timeout", "ruff"]
+
+[project.scripts]
+marimo-sandbox = "marimo_sandbox.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/marimo_sandbox"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["slow: integration tests that run real subprocesses"]
