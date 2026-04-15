@@ -59,9 +59,25 @@ code              Python source to execute
 description       Short label for this run (shown in list_runs)
 timeout_seconds   Max execution time (default 60)
 sandbox           Run in Docker with --network=none (default False)
+packages          PyPI packages to install before running (e.g. ["pandas", "httpx"])
 ```
 
-Returns: `run_id`, `status`, `stdout`, `stderr`, `error`, `notebook_path`, `view_command`
+Returns: `run_id`, `status`, `stdout`, `stderr`, `error`, `notebook_path`, `view_command`, and `packages_installed` (if any).
+
+Packages are installed via `uv pip install` when uv is available, falling back to `pip`. Installation happens before the notebook runs, so the packages are immediately importable in your code.
+
+### `rerun`
+
+Re-execute a previous run's code by `run_id`, optionally with modifications.
+
+```
+run_id            Run to re-execute
+code              Override the code (default: use original)
+description       Override the description (default: original + " (rerun)")
+timeout_seconds   Max execution time (default 60)
+sandbox           Run in Docker sandbox (default False)
+packages          PyPI packages to install before running
+```
 
 ### `open_notebook`
 
@@ -93,9 +109,29 @@ include_code             Include submitted code (default True)
 include_notebook_source  Include full .py notebook source (default False)
 ```
 
+### `delete_run`
+
+Remove a run's database record and its notebook files from disk.
+
+```
+run_id         Run to delete
+delete_files   Also remove the notebook directory (default True)
+```
+
+### `purge_runs`
+
+Bulk-delete runs older than N days to reclaim disk space.
+
+```
+older_than_days   Delete runs older than this many days (default 30)
+delete_files      Also remove notebook directories (default True)
+```
+
+Returns `deleted_runs`, `files_deleted`, and `run_ids`.
+
 ### `check_setup`
 
-Verify marimo and Docker are available and show the data directory.
+Verify marimo, Docker, and uv are available and show the data directory.
 
 ## Notebooks
 
