@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.1] - 2026-04-15
+
+### Fixed
+- mypy `python_version` reverted to `"3.11"` (correct minimum target); CI typecheck
+  job now runs on Python 3.11 so cryptography stubs are 3.11-compatible
+- `_build_explanation()` now includes the unified diff text inline when code changed,
+  so agents see the actual diff in the `explanation` string without a separate lookup
+
 ## [1.0.0] - 2026-04-15
 
 ### Added
