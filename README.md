@@ -15,7 +15,8 @@ marimo-sandbox fixes this by wrapping every execution in a Marimo notebook:
 - **Auditable** — the exact code that ran is saved as a `.py` file alongside its output
 - **Viewable** — `marimo edit <notebook>` opens it in the browser with reactive cells
 - **Re-runnable** — the notebook is standalone; `python notebook.py` works without the server
-- **Persistent** — all runs are stored in SQLite with stdout, stderr, and status
+- **Persistent** — all runs stored in SQLite with stdout, stderr, status, code hash, and artifacts
+- **Safe** — static risk analysis runs before every execution; critical patterns can require approval
 
 ## Install
 
@@ -60,11 +61,92 @@ description       Short label for this run (shown in list_runs)
 timeout_seconds   Max execution time (default 60)
 sandbox           Run in Docker with --network=none (default False)
 packages          PyPI packages to install before running (e.g. ["pandas", "httpx"])
+dry_run           If True, return static risk analysis only — do not execute (default False)
+require_approval  If True, block execution when critical risk patterns are found (default False)
 ```
 
-Returns: `run_id`, `status`, `stdout`, `stderr`, `error`, `notebook_path`, `view_command`, and `packages_installed` (if any).
+Returns: `run_id`, `status`, `stdout`, `stderr`, `error`, `duration_ms`, `notebook_path`,
+`view_command`, `code_hash`, `artifacts`, and optionally `risk_findings`, `packages_installed`,
+`freeze`.
 
-Packages are installed via `uv pip install` when uv is available, falling back to `pip`. Installation happens before the notebook runs, so the packages are immediately importable in your code.
+Packages are installed via `uv pip install` when uv is available, falling back to `pip`. A
+full `pip freeze` snapshot is captured after installation and stored with the run.
+
+#### Structured outputs
+
+Your code can expose typed data to agents via the `__outputs__` dict:
+
+```python
+import pandas as pd
+df = pd.read_csv("data.csv")
+__outputs__["summary"] = df.describe().to_dict()
+__outputs__["row_count"] = len(df)
+```
+
+Retrieve these values later with `get_run_outputs`.
+
+#### Static risk analysis
+
+Every call to `run_python` runs an AST-based risk scan before execution. Findings appear
+in `risk_findings` in the response. Use `dry_run=True` to get the analysis without running:
+
+```
+risk_findings severity tiers:
+  critical  subprocess calls, os.system/popen, eval/exec/compile
+  high      dangerous imports (os, subprocess, socket, requests, …)
+  medium    open() with write/append mode
+  low       os.environ[] access
+```
+
+Use `require_approval=True` to block execution when critical patterns are found. The response
+will include an `approval_token` — pass it to `approve_run` to proceed.
+
+### `approve_run`
+
+Confirm a blocked run and execute it. Tokens expire after 1 hour.
+
+```
+approval_token   Token returned by run_python when status='awaiting_confirmation'
+reason           Optional note explaining the approval
+```
+
+### `list_pending_approvals`
+
+List all runs currently awaiting approval, including expiry status and critical finding count.
+
+### `list_artifacts`
+
+List files created by a run's code (everything in the notebook directory except the
+notebook itself and the result sidecar).
+
+```
+run_id   Run to inspect
+```
+
+Returns `artifact_count` and `artifacts` — each entry has `path`, `size_bytes`, `extension`.
+
+### `read_artifact`
+
+Read the content of an artifact file. Path traversal is rejected. Large files are
+refused (default limit: 5 MB).
+
+```
+run_id          Run that created the file
+artifact_path   Relative path from list_artifacts
+max_size_bytes  Size limit in bytes (default 5 000 000)
+```
+
+Returns `content` (str) for text files or `content_base64` for binary files, plus
+`media_type`, `size_bytes`, `is_text`.
+
+### `get_run_outputs`
+
+Retrieve the structured `__outputs__` dict written by the run. Returns `{}` if the
+run hasn't completed successfully or didn't populate `__outputs__`.
+
+```
+run_id   Run to read outputs from
+```
 
 ### `rerun`
 
@@ -76,7 +158,7 @@ code              Override the code (default: use original)
 description       Override the description (default: original + " (rerun)")
 timeout_seconds   Max execution time (default 60)
 sandbox           Run in Docker sandbox (default False)
-packages          PyPI packages to install before running
+packages          PyPI packages to install (default: reuse original run's packages)
 ```
 
 ### `open_notebook`
@@ -150,6 +232,14 @@ Or run headlessly:
 python ~/.marimo-sandbox/notebooks/run_a1b2c3d4/notebook.py
 ```
 
+A result sidecar is written alongside the notebook on success:
+```
+~/.marimo-sandbox/notebooks/{run_id}/{run_id}_result.json
+```
+
+Any other files your code writes to disk are captured as artifacts and
+accessible via `list_artifacts` / `read_artifact`.
+
 ## Sandbox mode (Docker)
 
 For untrusted code, `run_python(sandbox=True)` runs inside Docker with:
@@ -181,8 +271,8 @@ Every generated notebook has four fixed cells:
 |---|---|
 | `__setup__` | Imports marimo, returns `(mo,)` |
 | `__context__` | Displays run metadata (description, run_id, timestamp) |
-| `__execution__` | Your code, plus a `sandbox_executed` sentinel in the return tuple |
-| `__record__` | Depends on `sandbox_executed` — only runs on success; writes result sidecar |
+| `__execution__` | Initialises `__outputs__: dict = {}`; runs your code; returns `(sandbox_executed, __outputs__)` |
+| `__record__` | Depends on `sandbox_executed` and `__outputs__` — only runs on success; writes result sidecar with outputs |
 
 The `__record__` → `__execution__` dependency means: if your code raises an
 exception, `__record__` never runs (Marimo's DAG won't execute a cell whose
@@ -197,6 +287,9 @@ uv pip install -e ".[dev]"
 
 # Lint
 ruff check src/ tests/
+
+# Type check
+mypy src/
 
 # Unit tests (fast, no subprocess)
 pytest tests/ -m "not slow" -v
