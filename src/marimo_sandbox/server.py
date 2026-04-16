@@ -1043,7 +1043,7 @@ def _impl_open_notebook(run_id: str, port: int = 2718) -> dict:
 
     # ── Launch marimo edit ───────────────────────────────────────────────
     process = subprocess.Popen(
-        [marimo_bin, "edit", str(notebook_path), "--port", str(port), "--no-token", "--no-sandbox"],
+        [marimo_bin, "edit", str(notebook_path), "--port", str(port), "--host", "127.0.0.1", "--no-token", "--no-sandbox", "--headless"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=env,

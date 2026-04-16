@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.0.7] - 2026-04-16
+
+### Fixed
+- `open_notebook` now passes `--headless` to prevent marimo from auto-opening
+  a browser at `localhost` (which can resolve to IPv6 `::1` on some systems)
+- Explicitly passes `--host 127.0.0.1` to ensure IPv4 binding
+- Users/agents now control the browser via the returned `http://127.0.0.1:{port}` URL
+
 ## [1.0.6] - 2026-04-16
 
 ### Fixed
