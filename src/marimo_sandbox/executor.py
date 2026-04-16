@@ -233,7 +233,7 @@ class NotebookExecutor:
             if _port_is_open(port):
                 return {
                     "success": True,
-                    "url": f"http://localhost:{port}",
+                    "url": f"http://127.0.0.1:{port}",
                     "pid": process.pid,
                     "notebook_path": str(notebook_path),
                     "message": "Notebook is open. Navigate to the URL to view it.",

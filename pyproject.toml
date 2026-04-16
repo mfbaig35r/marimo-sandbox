@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "marimo-sandbox"
-version = "1.0.2"
+version = "1.0.3"
 description = "FastMCP server: run Python in auditable Marimo notebooks"
 readme = "README.md"
 requires-python = ">=3.11"
