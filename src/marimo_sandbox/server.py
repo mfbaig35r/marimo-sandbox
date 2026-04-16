@@ -31,6 +31,7 @@ import os
 import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -139,6 +140,38 @@ def _scan_artifacts(notebook_dir: Path, run_id: str) -> list[str]:
 
 
 # ── Implementations ───────────────────────────────────────────────────────────
+
+
+def _inject_pep723_header(notebook_path: str, packages: list[str]) -> None:
+    """Prepend PEP 723 inline script metadata to *notebook_path*.
+
+    This tells ``marimo edit`` (via uv) which packages to install so the
+    notebook opens with a working kernel instead of showing "kernel not found".
+    """
+    path = Path(notebook_path)
+    if not path.exists():
+        return
+    content = path.read_text(encoding="utf-8")
+    if "# /// script" in content:
+        return
+    # Pin marimo to the installed version so --sandbox doesn't upgrade it and
+    # cause a notebook-format mismatch ("kernel not found" in the browser).
+    try:
+        import marimo as _marimo
+        marimo_pin = f"marimo=={_marimo.__version__}"
+    except Exception:
+        marimo_pin = "marimo"
+    pinned = [marimo_pin if p == "marimo" else p for p in packages]
+    dep_lines = "\n".join(f'#     "{pkg}",' for pkg in pinned)
+    header = (
+        "# /// script\n"
+        "# requires-python = \">=3.11\"\n"
+        "# dependencies = [\n"
+        f"{dep_lines}\n"
+        "# ]\n"
+        "# ///\n"
+    )
+    path.write_text(header + content, encoding="utf-8")
 
 
 def _impl_run_python(
@@ -256,6 +289,10 @@ def _impl_run_python(
             "notebook_path": None,
             "view_command": None,
         }
+
+    # Inject PEP 723 metadata so `marimo edit` can find the right kernel
+    if packages:
+        _inject_pep723_header(str(notebook.notebook_path), packages)
 
     if async_mode:
         # Persist as 'running' immediately
@@ -888,21 +925,57 @@ def run_python(
     )
 
 
+# ── Helpers for open_notebook ────────────────────────────────────────────────
+
+
+def _port_is_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        return s.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _free_port(port: int) -> None:
+    """Kill any process bound to *port* so marimo can claim it."""
+    try:
+        result = subprocess.run(
+            ["lsof", "-ti", f"tcp:{port}"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        for pid_str in result.stdout.strip().split():
+            try:
+                os.kill(int(pid_str), signal.SIGTERM)
+            except (ProcessLookupError, ValueError):
+                pass
+        if result.stdout.strip():
+            time.sleep(0.75)
+    except Exception:
+        pass
+
+
 @mcp.tool()
 def open_notebook(run_id: str, port: int = 2718) -> dict:
     """
     Open a run's Marimo notebook in the interactive editor.
 
-    Launches `marimo edit <notebook>` and returns a localhost URL to open in
-    the browser. The notebook shows the run metadata, the original code, and
-    the execution output — and lets you edit and re-run cells live.
+    Activates the run's cached virtualenv (which already has all required
+    packages installed) before launching ``marimo edit --no-sandbox``.
+
+    ``--no-sandbox`` is required: if the notebook contains a PEP 723
+    ``# /// script`` header, marimo auto-detects it and triggers uv sandbox
+    mode.  That uv-managed environment conflicts with our pre-activated venv
+    and causes "kernel not found".  ``--no-sandbox`` overrides the
+    auto-detection and uses the venv's Python for the kernel.
+
+    Any existing process already occupying *port* is killed first so the new
+    server always serves the requested run.
 
     Args:
         run_id:  The run ID returned by run_python.
         port:    Local port for the Marimo server (default 2718).
 
     Returns:
-        success, url, pid, notebook_path, message  — or success=False + error.
+        success, url, pid, notebook_path, message — or success=False + error.
     """
     run = db.get_run(run_id)
     if not run:
@@ -915,7 +988,45 @@ def open_notebook(run_id: str, port: int = 2718) -> dict:
             "error": f"Notebook file not found at {notebook_path}",
         }
 
-    return executor.open_interactive(notebook_path, port=port)
+    # Kill any existing server on this port so we don't accidentally return
+    # success against a stale process serving a different notebook.
+    _free_port(port)
+
+    # Activate the run's cached virtualenv so the kernel has all packages.
+    # Falls back to the current environment if the venv doesn't exist.
+    env = os.environ.copy()
+    if run.env_hash:
+        venv_dir = DATA_DIR / "envs" / run.env_hash
+        venv_bin = venv_dir / "bin"
+        if venv_bin.exists():
+            env["VIRTUAL_ENV"] = str(venv_dir)
+            env["PATH"] = str(venv_bin) + os.pathsep + env.get("PATH", "")
+
+    process = subprocess.Popen(
+        ["marimo", "edit", str(notebook_path), "--port", str(port), "--no-token", "--no-sandbox"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raw_err = process.stderr.read() if process.stderr else b""
+            stderr_text = raw_err.decode(errors="replace")[:400]
+            return {"success": False, "error": f"marimo exited: {stderr_text}"}
+        if _port_is_open(port):
+            return {
+                "success": True,
+                "url": f"http://localhost:{port}",
+                "pid": process.pid,
+                "notebook_path": str(notebook_path),
+                "message": "Notebook is open. Navigate to the URL to view it.",
+            }
+        time.sleep(0.25)
+
+    process.terminate()
+    return {"success": False, "error": "marimo did not become ready within 15 seconds"}
 
 
 def _impl_list_runs(
