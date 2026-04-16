@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.0.4] - 2026-04-16
+
+### Changed
+- `open_notebook` logic extracted into `_impl_open_notebook()` for reuse by snowbox
+- Server readiness now checked via HTTP `/health` endpoint instead of TCP port probe
+- `_free_port()` sends SIGKILL fallback when SIGTERM doesn't release the port
+- Pre-flight validation: checks venv existence and marimo binary before launching
+- Better error messages with "run check_setup to diagnose" hints
+- `check_setup` now reports `marimo_system_version` and `marimo_library_version`
+  and warns on version mismatch
+- Removed old `open_interactive()` from executor (logic moved to server)
+
+### Added
+- `get_marimo_version()` static method on `NotebookExecutor`
+- 10 new tests: `_server_is_healthy`, `_free_port` SIGKILL fallback,
+  `open_notebook` pre-flight, `check_setup` version mismatch, `get_marimo_version`
+- `docs/kernel-not-found-dev.md` and `docs/kernel-not-found-user.md`
+
 ## [1.0.1] - 2026-04-15
 
 ### Fixed
