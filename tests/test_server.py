@@ -1282,7 +1282,7 @@ def test_check_setup_version_mismatch():
         mock_exec.check_uv.return_value = True
         mock_exec.get_marimo_version.return_value = "0.19.11"
         mock_db.count_runs.return_value = 0
-        result = server_module.check_setup.fn()
+        result = server_module._impl_check_setup()
 
     assert result["marimo_system_version"] == "0.19.11"
     assert result["marimo_library_version"] == "0.23.1"
@@ -1299,7 +1299,7 @@ def test_check_setup_no_mismatch():
         mock_exec.check_uv.return_value = True
         mock_exec.get_marimo_version.return_value = "0.23.1"
         mock_db.count_runs.return_value = 0
-        result = server_module.check_setup.fn()
+        result = server_module._impl_check_setup()
 
     assert not any("VERSION MISMATCH" in n for n in result["notes"])
 

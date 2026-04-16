@@ -948,7 +948,7 @@ def _server_is_healthy(port: int) -> bool:
             if resp.status != 200:
                 return False
             body = _json.loads(resp.read())
-            return body.get("status") == "healthy"
+            return bool(body.get("status") == "healthy")
     except Exception:
         return False
 
@@ -1230,14 +1230,7 @@ def get_run(
     return _impl_get_run(run_id, include_code, include_notebook_source)
 
 
-@mcp.tool()
-def check_setup() -> dict:
-    """
-    Check that the sandbox environment is ready.
-
-    Returns the data directory, whether marimo and Docker are available,
-    total run count, version info, and any setup notes.
-    """
+def _impl_check_setup() -> dict:
     marimo_ok = executor.check_marimo()
     docker_ok = executor.check_docker()
 
@@ -1284,6 +1277,17 @@ def check_setup() -> dict:
         "ready": marimo_ok,
         "notes": notes,
     }
+
+
+@mcp.tool()
+def check_setup() -> dict:
+    """
+    Check that the sandbox environment is ready.
+
+    Returns the data directory, whether marimo and Docker are available,
+    total run count, version info, and any setup notes.
+    """
+    return _impl_check_setup()
 
 
 @mcp.tool()

@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.5] - 2026-04-16
+
+### Fixed
+- mypy `no-any-return` error in `_server_is_healthy` (wrap comparison in `bool()`)
+- CI test failures: extract `_impl_check_setup()` so tests don't depend on
+  FastMCP `.fn` attribute; snowbox now imports `_impl_check_setup` directly
+
 ## [1.0.4] - 2026-04-16
 
 ### Changed
