@@ -1,6 +1,7 @@
 """Unit tests for server-level tools: delete_run, rerun, purge_runs, artifacts, approval gates."""
 
 import json
+import signal
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -1129,3 +1130,195 @@ def test_list_pending_approvals_shows_pending():
     pending_2 = next(p for p in result["pending"] if p["approval_token"] == "approval_2")
     assert pending_2["expired"] is True
     assert pending_2["critical_finding_count"] == 1
+
+
+# ── _server_is_healthy ─────────────────────────────────────────────────────
+
+
+def test_server_is_healthy_returns_true_on_healthy():
+    import io
+    import json as _json
+
+    body = _json.dumps({"status": "healthy"}).encode()
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.read.return_value = body
+    mock_resp.__enter__ = lambda s: s
+    mock_resp.__exit__ = MagicMock(return_value=False)
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        assert server_module._server_is_healthy(2718) is True
+
+
+def test_server_is_healthy_returns_false_on_bad_status():
+    body = b'{"status": "starting"}'
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.read.return_value = body
+    mock_resp.__enter__ = lambda s: s
+    mock_resp.__exit__ = MagicMock(return_value=False)
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        assert server_module._server_is_healthy(2718) is False
+
+
+def test_server_is_healthy_returns_false_on_connection_error():
+    import urllib.error
+
+    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("refused")):
+        assert server_module._server_is_healthy(2718) is False
+
+
+# ── _free_port SIGKILL fallback ────────────────────────────────────────────
+
+
+def test_free_port_sigkill_fallback():
+    """When SIGTERM doesn't free the port, _free_port should send SIGKILL."""
+    lsof_result = MagicMock()
+    lsof_result.stdout = "12345\n"
+
+    call_count = [0]
+    def mock_run(cmd, **kwargs):
+        call_count[0] += 1
+        return lsof_result
+
+    kills = []
+    def mock_kill(pid, sig):
+        kills.append((pid, sig))
+
+    with patch("subprocess.run", side_effect=mock_run), \
+         patch.object(server_module.os, "kill", side_effect=mock_kill), \
+         patch.object(server_module.time, "sleep"), \
+         patch.object(server_module, "_port_is_open", return_value=True):
+        server_module._free_port(2718)
+
+    # Should have sent SIGTERM and then SIGKILL
+    assert (12345, signal.SIGTERM) in kills
+    assert (12345, signal.SIGKILL) in kills
+
+
+def test_free_port_no_sigkill_when_port_freed():
+    """When SIGTERM frees the port, no SIGKILL should be sent."""
+    lsof_result = MagicMock()
+    lsof_result.stdout = "12345\n"
+
+    kills = []
+    def mock_kill(pid, sig):
+        kills.append((pid, sig))
+
+    with patch("subprocess.run", return_value=lsof_result), \
+         patch.object(server_module.os, "kill", side_effect=mock_kill), \
+         patch.object(server_module.time, "sleep"), \
+         patch.object(server_module, "_port_is_open", return_value=False):
+        server_module._free_port(2718)
+
+    assert (12345, signal.SIGTERM) in kills
+    assert all(sig != signal.SIGKILL for _, sig in kills)
+
+
+# ── open_notebook pre-flight validation ──────────────────────────────────
+
+
+def test_open_notebook_venv_missing(tmp_path):
+    """When env_hash points to a nonexistent dir, return a clear error."""
+    run = RunRecord(
+        run_id="run_venv",
+        code="pass",
+        description="test",
+        packages=["pandas"],
+        status=RunStatus.SUCCESS,
+        notebook_path=str(tmp_path / "notebook.py"),
+        created_at="2026-01-01 00:00:00",
+        env_hash="nonexistent_hash",
+    )
+    (tmp_path / "notebook.py").touch()
+
+    with patch.object(server_module, "db") as mock_db, \
+         patch.object(server_module, "_free_port"), \
+         patch.object(server_module, "DATA_DIR", tmp_path):
+        mock_db.get_run.return_value = run
+        result = server_module._impl_open_notebook("run_venv")
+
+    assert result["success"] is False
+    assert "not found" in result["error"].lower()
+    assert "nonexistent_hash" in result["error"]
+
+
+def test_open_notebook_marimo_not_found(tmp_path):
+    """When marimo is not runnable, return an actionable error."""
+    run = RunRecord(
+        run_id="run_nomarimo",
+        code="pass",
+        description="test",
+        packages=[],
+        status=RunStatus.SUCCESS,
+        notebook_path=str(tmp_path / "notebook.py"),
+        created_at="2026-01-01 00:00:00",
+    )
+    (tmp_path / "notebook.py").touch()
+
+    with patch.object(server_module, "db") as mock_db, \
+         patch.object(server_module, "_free_port"), \
+         patch.object(server_module, "executor") as mock_exec:
+        mock_db.get_run.return_value = run
+        mock_exec.get_marimo_version.return_value = None
+        result = server_module._impl_open_notebook("run_nomarimo")
+
+    assert result["success"] is False
+    assert "not found" in result["error"].lower() or "not runnable" in result["error"].lower()
+    assert "check_setup" in result["error"]
+
+
+# ── check_setup version mismatch ─────────────────────────────────────────
+
+
+def test_check_setup_version_mismatch():
+    """When system and library marimo versions differ, warn about mismatch."""
+    with patch.object(server_module, "executor") as mock_exec, \
+         patch.object(server_module, "db") as mock_db, \
+         patch.dict("sys.modules", {"marimo": MagicMock(__version__="0.23.1")}):
+        mock_exec.check_marimo.return_value = True
+        mock_exec.check_docker.return_value = False
+        mock_exec.check_uv.return_value = True
+        mock_exec.get_marimo_version.return_value = "0.19.11"
+        mock_db.count_runs.return_value = 0
+        result = server_module.check_setup.fn()
+
+    assert result["marimo_system_version"] == "0.19.11"
+    assert result["marimo_library_version"] == "0.23.1"
+    assert any("VERSION MISMATCH" in n for n in result["notes"])
+
+
+def test_check_setup_no_mismatch():
+    """When versions match, no mismatch warning should appear."""
+    with patch.object(server_module, "executor") as mock_exec, \
+         patch.object(server_module, "db") as mock_db, \
+         patch.dict("sys.modules", {"marimo": MagicMock(__version__="0.23.1")}):
+        mock_exec.check_marimo.return_value = True
+        mock_exec.check_docker.return_value = False
+        mock_exec.check_uv.return_value = True
+        mock_exec.get_marimo_version.return_value = "0.23.1"
+        mock_db.count_runs.return_value = 0
+        result = server_module.check_setup.fn()
+
+    assert not any("VERSION MISMATCH" in n for n in result["notes"])
+
+
+# ── get_marimo_version ───────────────────────────────────────────────────
+
+
+def test_get_marimo_version_parses_output():
+    from marimo_sandbox.executor import NotebookExecutor
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = "marimo 0.23.1\n"
+    with patch("subprocess.run", return_value=mock_result):
+        assert NotebookExecutor.get_marimo_version() == "0.23.1"
+
+
+def test_get_marimo_version_returns_none_on_failure():
+    from marimo_sandbox.executor import NotebookExecutor
+
+    with patch("subprocess.run", side_effect=FileNotFoundError):
+        assert NotebookExecutor.get_marimo_version() is None

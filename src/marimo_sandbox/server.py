@@ -933,6 +933,26 @@ def _port_is_open(port: int) -> bool:
         return s.connect_ex(("127.0.0.1", port)) == 0
 
 
+def _server_is_healthy(port: int) -> bool:
+    """Return True when marimo's HTTP server is fully ready (not just TCP open)."""
+    import json as _json
+    import urllib.request
+    import urllib.error
+
+    try:
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/health",
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            if resp.status != 200:
+                return False
+            body = _json.loads(resp.read())
+            return body.get("status") == "healthy"
+    except Exception:
+        return False
+
+
 def _free_port(port: int) -> None:
     """Kill any process bound to *port* so marimo can claim it."""
     try:
@@ -949,8 +969,128 @@ def _free_port(port: int) -> None:
                 pass
         if result.stdout.strip():
             time.sleep(0.75)
+            # SIGKILL fallback: if port is still occupied, force-kill stragglers
+            if _port_is_open(port):
+                try:
+                    retry = subprocess.run(
+                        ["lsof", "-ti", f"tcp:{port}"],
+                        capture_output=True,
+                        text=True,
+                        timeout=3,
+                    )
+                    for pid_str in retry.stdout.strip().split():
+                        try:
+                            os.kill(int(pid_str), signal.SIGKILL)
+                        except (ProcessLookupError, ValueError):
+                            pass
+                except Exception:
+                    pass
     except Exception:
         pass
+
+
+def _impl_open_notebook(run_id: str, port: int = 2718) -> dict:
+    """Core logic for open_notebook, shared by marimo-sandbox and snowbox."""
+    run = db.get_run(run_id)
+    if not run:
+        return {"success": False, "error": f"Run not found: {run_id}"}
+
+    notebook_path = Path(run.notebook_path)
+    if not notebook_path.exists():
+        return {
+            "success": False,
+            "error": f"Notebook file not found at {notebook_path}",
+        }
+
+    # Kill any existing server on this port so we don't accidentally return
+    # success against a stale process serving a different notebook.
+    _free_port(port)
+
+    # ── Pre-flight: resolve marimo binary and venv ───────────────────────
+    env = os.environ.copy()
+    marimo_bin = "marimo"
+
+    if run.env_hash:
+        venv_dir = DATA_DIR / "envs" / run.env_hash
+        if not venv_dir.exists():
+            return {
+                "success": False,
+                "error": (
+                    f"Virtual environment not found at {venv_dir}. "
+                    "It may have been cleaned. Re-run with the same packages "
+                    "to recreate it, or use clean_environments to check."
+                ),
+            }
+        venv_bin = venv_dir / "bin"
+        if venv_bin.exists():
+            env["VIRTUAL_ENV"] = str(venv_dir)
+            env["PATH"] = str(venv_bin) + os.pathsep + env.get("PATH", "")
+            # Prefer the venv's marimo if available
+            venv_marimo = venv_bin / "marimo"
+            if venv_marimo.exists():
+                marimo_bin = str(venv_marimo)
+
+    # Verify marimo is runnable
+    version = executor.get_marimo_version(marimo_bin)
+    if version is None:
+        return {
+            "success": False,
+            "error": (
+                f"marimo not found or not runnable at '{marimo_bin}'. "
+                "Run check_setup to diagnose, or install with: pip install marimo"
+            ),
+        }
+
+    # ── Launch marimo edit ───────────────────────────────────────────────
+    process = subprocess.Popen(
+        [marimo_bin, "edit", str(notebook_path), "--port", str(port), "--no-token", "--no-sandbox"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+    )
+
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        exit_code = process.poll()
+        if exit_code is not None:
+            raw_out = process.stdout.read() if process.stdout else b""
+            raw_err = process.stderr.read() if process.stderr else b""
+            stdout_text = raw_out.decode(errors="replace")[:200]
+            stderr_text = raw_err.decode(errors="replace")[:400]
+            detail = stderr_text or stdout_text or "(no output captured)"
+            return {
+                "success": False,
+                "error": (
+                    f"marimo exited with code {exit_code}: {detail}  "
+                    "Hint: run check_setup to diagnose."
+                ),
+            }
+        if _server_is_healthy(port):
+            return {
+                "success": True,
+                "url": f"http://127.0.0.1:{port}",
+                "pid": process.pid,
+                "notebook_path": str(notebook_path),
+                "message": "Notebook is open. Navigate to the URL to view it.",
+            }
+        time.sleep(0.25)
+
+    # Timeout — capture whatever stderr is available before killing
+    raw_err = b""
+    if process.stderr:
+        import selectors
+        sel = selectors.DefaultSelector()
+        sel.register(process.stderr, selectors.EVENT_READ)
+        if sel.select(timeout=0):
+            raw_err = process.stderr.read1(4096) if hasattr(process.stderr, "read1") else b""
+        sel.close()
+    stderr_hint = raw_err.decode(errors="replace")[:300]
+    process.terminate()
+    msg = "marimo did not become ready within 15 seconds."
+    if stderr_hint:
+        msg += f" stderr: {stderr_hint}"
+    msg += " Hint: run check_setup to diagnose."
+    return {"success": False, "error": msg}
 
 
 @mcp.tool()
@@ -977,56 +1117,7 @@ def open_notebook(run_id: str, port: int = 2718) -> dict:
     Returns:
         success, url, pid, notebook_path, message — or success=False + error.
     """
-    run = db.get_run(run_id)
-    if not run:
-        return {"success": False, "error": f"Run not found: {run_id}"}
-
-    notebook_path = Path(run.notebook_path)
-    if not notebook_path.exists():
-        return {
-            "success": False,
-            "error": f"Notebook file not found at {notebook_path}",
-        }
-
-    # Kill any existing server on this port so we don't accidentally return
-    # success against a stale process serving a different notebook.
-    _free_port(port)
-
-    # Activate the run's cached virtualenv so the kernel has all packages.
-    # Falls back to the current environment if the venv doesn't exist.
-    env = os.environ.copy()
-    if run.env_hash:
-        venv_dir = DATA_DIR / "envs" / run.env_hash
-        venv_bin = venv_dir / "bin"
-        if venv_bin.exists():
-            env["VIRTUAL_ENV"] = str(venv_dir)
-            env["PATH"] = str(venv_bin) + os.pathsep + env.get("PATH", "")
-
-    process = subprocess.Popen(
-        ["marimo", "edit", str(notebook_path), "--port", str(port), "--no-token", "--no-sandbox"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-    )
-
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raw_err = process.stderr.read() if process.stderr else b""
-            stderr_text = raw_err.decode(errors="replace")[:400]
-            return {"success": False, "error": f"marimo exited: {stderr_text}"}
-        if _port_is_open(port):
-            return {
-                "success": True,
-                "url": f"http://127.0.0.1:{port}",
-                "pid": process.pid,
-                "notebook_path": str(notebook_path),
-                "message": "Notebook is open. Navigate to the URL to view it.",
-            }
-        time.sleep(0.25)
-
-    process.terminate()
-    return {"success": False, "error": "marimo did not become ready within 15 seconds"}
+    return _impl_open_notebook(run_id, port)
 
 
 def _impl_list_runs(
@@ -1145,12 +1236,20 @@ def check_setup() -> dict:
     Check that the sandbox environment is ready.
 
     Returns the data directory, whether marimo and Docker are available,
-    total run count, and any setup notes.
+    total run count, version info, and any setup notes.
     """
     marimo_ok = executor.check_marimo()
     docker_ok = executor.check_docker()
 
-    notes = []
+    # Version introspection
+    system_version = executor.get_marimo_version()
+    try:
+        import marimo as _marimo
+        library_version: str | None = _marimo.__version__
+    except Exception:
+        library_version = None
+
+    notes: list[str] = []
     if not marimo_ok:
         notes.append("marimo is not installed or not on PATH. Run: pip install marimo")
     if not docker_ok:
@@ -1158,10 +1257,27 @@ def check_setup() -> dict:
             "Docker is not available. sandbox=True in run_python will fail. "
             "Install Docker Desktop to enable sandboxed execution."
         )
+    if (
+        system_version
+        and library_version
+        and system_version != library_version
+    ):
+        notes.append(
+            f"VERSION MISMATCH: system marimo is {system_version} but the "
+            f"Python library is {library_version}. This can cause 'kernel not "
+            f"found' errors. Fix: pip install marimo=={system_version}  OR  "
+            f"pipx upgrade marimo"
+        )
+    notes.append(
+        "If notebooks show 'kernel not found', try a hard refresh "
+        "(Cmd+Shift+R / Ctrl+Shift+R) to clear the browser cache."
+    )
 
     return {
         "data_dir": str(DATA_DIR),
         "marimo_available": marimo_ok,
+        "marimo_system_version": system_version,
+        "marimo_library_version": library_version,
         "docker_available": docker_ok,
         "uv_available": executor.check_uv(),
         "total_runs": db.count_runs(),
