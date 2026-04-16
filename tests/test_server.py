@@ -1136,7 +1136,6 @@ def test_list_pending_approvals_shows_pending():
 
 
 def test_server_is_healthy_returns_true_on_healthy():
-    import io
     import json as _json
 
     body = _json.dumps({"status": "healthy"}).encode()

@@ -936,8 +936,8 @@ def _port_is_open(port: int) -> bool:
 def _server_is_healthy(port: int) -> bool:
     """Return True when marimo's HTTP server is fully ready (not just TCP open)."""
     import json as _json
-    import urllib.request
     import urllib.error
+    import urllib.request
 
     try:
         req = urllib.request.Request(

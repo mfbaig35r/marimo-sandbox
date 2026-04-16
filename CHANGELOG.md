@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.0.6] - 2026-04-16
+
+### Fixed
+- ruff lint: import ordering in `_server_is_healthy`, unused `import io` in tests
+
 ## [1.0.5] - 2026-04-16
 
 ### Fixed
