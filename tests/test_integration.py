@@ -174,7 +174,18 @@ def test_run_with_packages(setup, tmp_path: Path) -> None:
 
 @pytest.fixture
 def docker_available() -> bool:
-    return NotebookExecutor.check_docker()
+    if not NotebookExecutor.check_docker():
+        return False
+    # Also check that the sandbox image is built locally
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["docker", "images", "-q", "marimo-sandbox:latest"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
 
 
 @pytest.mark.slow
