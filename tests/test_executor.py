@@ -1,5 +1,6 @@
 """Unit tests for executor helper functions."""
 
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -199,6 +200,161 @@ def test_execute_async_returns_popen(tmp_path: Path, executor: NotebookExecutor)
         process = executor.execute_async(nb, timeout_seconds=5)
     assert process is mock_process
     mock_popen.assert_called_once()
+
+
+# ── Docker sandbox tests ─────────────────────────────────────────────────────
+
+
+def test_run_docker_passes_correct_flags(tmp_path: Path, executor: NotebookExecutor) -> None:
+    """Verify _run_docker builds the correct docker run command."""
+    nb_path = tmp_path / "notebook.py"
+    nb_path.touch()
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = ""
+    mock_result.stderr = ""
+
+    with patch("subprocess.run", return_value=mock_result) as mock_run:
+        executor._run_docker(nb_path, timeout=30)
+
+    mock_run.assert_called_once()
+    cmd = mock_run.call_args[0][0]
+
+    assert cmd[0] == "docker"
+    assert cmd[1] == "run"
+    assert "--rm" in cmd
+    assert "--memory=512m" in cmd
+    assert "--cpus=1" in cmd
+    assert "--network=none" in cmd
+    assert "--read-only" in cmd
+    # tmpfs with noexec
+    tmpfs_arg = [a for a in cmd if a.startswith("--tmpfs")]
+    assert len(tmpfs_arg) == 1
+    assert "noexec" in tmpfs_arg[0]
+    # Volume mount for notebook dir
+    vol_args = [a for a in cmd if a.startswith(str(tmp_path))]
+    assert len(vol_args) == 1
+    assert vol_args[0].endswith(":/sandbox:rw")
+    # Entrypoint is "python", so only the script path is passed as arg
+    assert cmd[-1] == f"/sandbox/{nb_path.name}"
+    assert cmd[-2] == "marimo-sandbox:latest"  # no extra "python" between image and path
+
+
+def test_run_docker_uses_configured_image(tmp_path: Path) -> None:
+    """Verify custom docker_image is passed to docker run."""
+    custom_executor = NotebookExecutor(docker_image="my-custom-image:v2")
+    nb_path = tmp_path / "notebook.py"
+    nb_path.touch()
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = ""
+    mock_result.stderr = ""
+
+    with patch("subprocess.run", return_value=mock_result) as mock_run:
+        custom_executor._run_docker(nb_path, timeout=30)
+
+    cmd = mock_run.call_args[0][0]
+    assert "my-custom-image:v2" in cmd
+
+
+def test_run_docker_passes_timeout(tmp_path: Path, executor: NotebookExecutor) -> None:
+    """Verify timeout is forwarded to subprocess.run."""
+    nb_path = tmp_path / "notebook.py"
+    nb_path.touch()
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = ""
+    mock_result.stderr = ""
+
+    with patch("subprocess.run", return_value=mock_result) as mock_run:
+        executor._run_docker(nb_path, timeout=45)
+
+    kwargs = mock_run.call_args[1]
+    assert kwargs["timeout"] == 45
+
+
+def test_execute_sandbox_true_calls_docker(tmp_path: Path, executor: NotebookExecutor) -> None:
+    """Verify execute() dispatches to _run_docker when sandbox=True."""
+    nb = _make_nb(tmp_path)
+    nb.result_path.touch()  # pretend success
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = "ok"
+    mock_result.stderr = ""
+
+    with patch.object(executor, "_run_docker", return_value=mock_result) as mock_docker, \
+         patch.object(executor, "_run_subprocess") as mock_sub:
+        result = executor.execute(nb, timeout_seconds=30, sandbox=True)
+
+    mock_docker.assert_called_once_with(nb.notebook_path, 30)
+    mock_sub.assert_not_called()
+    assert result.status == "success"
+
+
+def test_execute_sandbox_false_calls_subprocess(
+    tmp_path: Path, executor: NotebookExecutor
+) -> None:
+    """Verify execute() dispatches to _run_subprocess when sandbox=False."""
+    nb = _make_nb(tmp_path)
+    nb.result_path.touch()
+
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = "ok"
+    mock_result.stderr = ""
+
+    with patch.object(executor, "_run_subprocess", return_value=mock_result) as mock_sub, \
+         patch.object(executor, "_run_docker") as mock_docker:
+        result = executor.execute(nb, timeout_seconds=30, sandbox=False)
+
+    mock_sub.assert_called_once()
+    mock_docker.assert_not_called()
+    assert result.status == "success"
+
+
+def test_execute_async_sandbox_true_uses_docker_cmd(
+    tmp_path: Path, executor: NotebookExecutor
+) -> None:
+    """Verify execute_async builds docker command when sandbox=True."""
+    nb_path = tmp_path / "notebook.py"
+    nb_path.write_text("print('hi')")
+    nb = GeneratedNotebook(
+        run_id="run_dock", notebook_path=nb_path, notebook_dir=tmp_path, content=""
+    )
+    mock_process = MagicMock()
+    mock_process.pid = 5678
+
+    with patch("subprocess.Popen", return_value=mock_process) as mock_popen:
+        process = executor.execute_async(nb, timeout_seconds=10, sandbox=True)
+
+    cmd = mock_popen.call_args[0][0]
+    assert cmd[0] == "docker"
+    assert "--network=none" in cmd
+    assert "--read-only" in cmd
+    assert process is mock_process
+
+
+def test_execute_docker_timeout_returns_error(
+    tmp_path: Path, executor: NotebookExecutor
+) -> None:
+    """Verify TimeoutExpired from docker run is handled gracefully."""
+    nb = _make_nb(tmp_path)
+
+    with patch.object(
+        executor, "_run_docker",
+        side_effect=subprocess.TimeoutExpired(cmd="docker run", timeout=10),
+    ):
+        result = executor.execute(nb, timeout_seconds=10, sandbox=True)
+
+    assert result.status == "error"
+    assert "Timed out" in result.error
+
+
+# ── install_packages tests (continued) ──────────────────────────────────────
 
 
 def test_install_packages_both_fail(executor: NotebookExecutor) -> None:

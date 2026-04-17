@@ -142,7 +142,7 @@ class NotebookExecutor:
                 "-v", f"{notebook_dir}:/sandbox:rw",
                 "-w", "/sandbox",
                 self.docker_image,
-                "python", f"/sandbox/{notebook.notebook_path.name}",
+                f"/sandbox/{notebook.notebook_path.name}",
             ]
         else:
             cmd = [interpreter, str(notebook.notebook_path)]
@@ -183,7 +183,7 @@ class NotebookExecutor:
             "-v", f"{notebook_dir}:/sandbox:rw",
             "-w", "/sandbox",
             self.docker_image,
-            "python", f"/sandbox/{notebook_path.name}",
+            f"/sandbox/{notebook_path.name}",
         ]
         return subprocess.run(
             cmd,

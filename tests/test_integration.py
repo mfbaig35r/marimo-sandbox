@@ -167,3 +167,96 @@ def test_run_with_packages(setup, tmp_path: Path) -> None:
     assert result.stdout is not None
     # Version string should contain at least one digit and dot
     assert any(ch.isdigit() for ch in result.stdout)
+
+
+# ── Docker sandbox integration tests ────────────────────────────────────────
+
+
+@pytest.fixture
+def docker_available() -> bool:
+    return NotebookExecutor.check_docker()
+
+
+@pytest.mark.slow
+def test_docker_sandbox_simple_code(setup, docker_available: bool) -> None:
+    if not docker_available:
+        pytest.skip("Docker not available")
+    db, gen, exe = setup
+    code = 'print("hello from docker sandbox")'
+    nb = gen.generate("run_docker_hello", "Docker hello test", code)
+    db.create_run("run_docker_hello", "Docker hello test", code, str(nb.notebook_path))
+
+    result = exe.execute(nb, timeout_seconds=120, sandbox=True)
+
+    assert result.status == "success", f"stderr: {result.stderr}\nerror: {result.error}"
+    assert result.stdout is not None
+    assert "hello from docker sandbox" in result.stdout
+
+
+@pytest.mark.slow
+def test_docker_sandbox_produces_sidecar(setup, docker_available: bool) -> None:
+    if not docker_available:
+        pytest.skip("Docker not available")
+    db, gen, exe = setup
+    code = "x = 2 + 2"
+    nb = gen.generate("run_docker_sidecar", "Docker sidecar test", code)
+    db.create_run("run_docker_sidecar", "Docker sidecar test", code, str(nb.notebook_path))
+
+    result = exe.execute(nb, timeout_seconds=120, sandbox=True)
+
+    assert result.status == "success", f"stderr: {result.stderr}\nerror: {result.error}"
+    assert nb.result_path.exists(), "Expected _result.json sidecar from Docker run"
+
+
+@pytest.mark.slow
+def test_docker_sandbox_error_code(setup, docker_available: bool) -> None:
+    if not docker_available:
+        pytest.skip("Docker not available")
+    db, gen, exe = setup
+    code = 'raise ValueError("docker boom")'
+    nb = gen.generate("run_docker_error", "Docker error test", code)
+    db.create_run("run_docker_error", "Docker error test", code, str(nb.notebook_path))
+
+    result = exe.execute(nb, timeout_seconds=120, sandbox=True)
+
+    assert result.status == "error"
+    assert not nb.result_path.exists()
+
+
+@pytest.mark.slow
+def test_docker_sandbox_no_network(setup, docker_available: bool) -> None:
+    """Code that tries to reach the network should fail inside the sandbox."""
+    if not docker_available:
+        pytest.skip("Docker not available")
+    db, gen, exe = setup
+    code = (
+        "import urllib.request\n"
+        "urllib.request.urlopen('http://httpbin.org/get')\n"
+        "print('network worked')"
+    )
+    nb = gen.generate("run_docker_nonet", "Docker no-network test", code)
+    db.create_run("run_docker_nonet", "Docker no-network test", code, str(nb.notebook_path))
+
+    result = exe.execute(nb, timeout_seconds=120, sandbox=True)
+
+    assert result.status == "error"
+    # Should NOT have succeeded in fetching
+    if result.stdout:
+        assert "network worked" not in result.stdout
+
+
+@pytest.mark.slow
+def test_docker_sandbox_numpy_available(setup, docker_available: bool) -> None:
+    """numpy is baked into the Docker image and should be importable."""
+    if not docker_available:
+        pytest.skip("Docker not available")
+    db, gen, exe = setup
+    code = "import numpy as np; print(f'numpy {np.__version__}')"
+    nb = gen.generate("run_docker_numpy", "Docker numpy test", code)
+    db.create_run("run_docker_numpy", "Docker numpy test", code, str(nb.notebook_path))
+
+    result = exe.execute(nb, timeout_seconds=120, sandbox=True)
+
+    assert result.status == "success", f"stderr: {result.stderr}\nerror: {result.error}"
+    assert result.stdout is not None
+    assert "numpy" in result.stdout
