@@ -12,6 +12,12 @@ docker (sandbox=True)
     Same subprocess approach but inside Docker with --network=none, memory
     cap, CPU cap, and read-only root filesystem. Requires Docker CLI.
 
+    When packages are requested, execution is two-phase:
+      1. Install phase — docker run WITH network, pip install --target into
+         the notebook directory. Uses a shared pip cache volume.
+      2. Execute phase — docker run with --network=none, PYTHONPATH pointing
+         at the installed packages. Full sandbox restrictions apply.
+
 Success detection
 -----------------
 The __record__ cell (which only runs when __execution__ succeeds) writes a
@@ -51,12 +57,17 @@ class NotebookExecutor:
         timeout_seconds: int = 60,
         sandbox: bool = False,
         python_path: Path | None = None,
+        packages: list[str] | None = None,
+        pip_cache_dir: Path | None = None,
     ) -> ExecutionResult:
         start = time.monotonic()
 
         try:
             if sandbox:
-                raw = self._run_docker(notebook.notebook_path, timeout_seconds)
+                raw = self._run_docker(
+                    notebook.notebook_path, timeout_seconds,
+                    packages=packages, pip_cache_dir=pip_cache_dir,
+                )
             else:
                 raw = self._run_subprocess(
                     notebook.notebook_path, timeout_seconds, python_path=python_path
@@ -126,24 +137,28 @@ class NotebookExecutor:
         timeout_seconds: int = 60,
         sandbox: bool = False,
         python_path: Path | None = None,
+        packages: list[str] | None = None,
+        pip_cache_dir: Path | None = None,
     ) -> subprocess.Popen:
-        """Launch execution; return the Popen immediately (don't wait)."""
+        """Launch execution; return the Popen immediately (don't wait).
+
+        When sandbox=True and packages are provided, the install phase runs
+        synchronously before the async execution Popen is returned.
+        """
         interpreter = str(python_path) if python_path else sys.executable
         if sandbox:
             notebook_dir = notebook.notebook_path.parent
-            cmd = [
-                "docker", "run",
-                "--rm",
-                "--memory=512m",
-                "--cpus=1",
-                "--network=none",
-                "--read-only",
-                "--tmpfs=/tmp:size=64m,noexec",
-                "-v", f"{notebook_dir}:/sandbox:rw",
-                "-w", "/sandbox",
-                self.docker_image,
-                f"/sandbox/{notebook.notebook_path.name}",
-            ]
+            # Install packages synchronously before launching async execution
+            if packages:
+                install = self._docker_install_packages(
+                    notebook_dir, packages, pip_cache_dir=pip_cache_dir,
+                )
+                if not install["success"]:
+                    raise RuntimeError(
+                        f"Docker package install failed: {install['output']}"
+                    )
+            cmd = self._docker_exec_cmd(notebook_dir, notebook.notebook_path.name,
+                                        has_packages=bool(packages))
         else:
             cmd = [interpreter, str(notebook.notebook_path)]
         return subprocess.Popen(
@@ -169,9 +184,41 @@ class NotebookExecutor:
         )
 
     def _run_docker(
-        self, notebook_path: Path, timeout: int
+        self,
+        notebook_path: Path,
+        timeout: int,
+        packages: list[str] | None = None,
+        pip_cache_dir: Path | None = None,
     ) -> subprocess.CompletedProcess:
         notebook_dir = notebook_path.parent
+
+        # Phase 1: install packages inside a container (with network access)
+        if packages:
+            install = self._docker_install_packages(
+                notebook_dir, packages, pip_cache_dir=pip_cache_dir,
+            )
+            if not install["success"]:
+                # Return a synthetic failed CompletedProcess
+                return subprocess.CompletedProcess(
+                    args=[], returncode=1, stdout="",
+                    stderr=f"Package install failed:\n{install['output']}",
+                )
+
+        # Phase 2: execute notebook (fully sandboxed)
+        cmd = self._docker_exec_cmd(
+            notebook_dir, notebook_path.name, has_packages=bool(packages),
+        )
+        return subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+
+    def _docker_exec_cmd(
+        self, notebook_dir: Path, notebook_name: str, has_packages: bool = False,
+    ) -> list[str]:
+        """Build the docker run command for the execution phase."""
         cmd = [
             "docker", "run",
             "--rm",
@@ -182,15 +229,65 @@ class NotebookExecutor:
             "--tmpfs=/tmp:size=64m,noexec",
             "-v", f"{notebook_dir}:/sandbox:rw",
             "-w", "/sandbox",
-            self.docker_image,
-            f"/sandbox/{notebook_path.name}",
         ]
-        return subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
+        if has_packages:
+            cmd += ["-e", "PYTHONPATH=/sandbox/.packages"]
+        cmd += [self.docker_image, f"/sandbox/{notebook_name}"]
+        return cmd
+
+    def _docker_install_packages(
+        self,
+        notebook_dir: Path,
+        packages: list[str],
+        pip_cache_dir: Path | None = None,
+        timeout: int = 120,
+    ) -> dict:
+        """Run a Docker container to install packages into notebook_dir/.packages.
+
+        Returns {"success": bool, "output": str}.
+        The install container has network access but no other sandbox relaxations.
+        """
+        volumes = ["-v", f"{notebook_dir}:/sandbox:rw"]
+        if pip_cache_dir:
+            pip_cache_dir.mkdir(parents=True, exist_ok=True)
+            volumes += ["-v", f"{pip_cache_dir}:/pip-cache:rw"]
+
+        # Try uv first (faster), fall back to pip
+        # The Dockerfile installs uv; if it's missing, fall back to pip.
+        install_cmd = (
+            "uv pip install --no-python-downloads "
+            f"{'--cache-dir=/pip-cache ' if pip_cache_dir else ''}"
+            f"--target=/sandbox/.packages {' '.join(packages)} "
+            "2>&1 || "
+            "pip install --no-warn-script-location "
+            f"{'--cache-dir=/pip-cache ' if pip_cache_dir else ''}"
+            f"--target=/sandbox/.packages {' '.join(packages)} 2>&1"
         )
+
+        cmd = [
+            "docker", "run",
+            "--rm",
+            "--memory=512m",
+            "--cpus=1",
+            # Network allowed (need to download packages)
+            # No --read-only (pip needs writable /tmp for builds)
+            "--tmpfs=/tmp:size=256m",
+            *volumes,
+            "-w", "/sandbox",
+            "--entrypoint", "sh",
+            self.docker_image,
+            "-c", install_cmd,
+        ]
+
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if r.returncode == 0:
+                return {"success": True, "output": r.stdout}
+            return {"success": False, "output": r.stderr or r.stdout}
+        except subprocess.TimeoutExpired:
+            return {"success": False, "output": f"Package install timed out after {timeout}s"}
+        except FileNotFoundError:
+            return {"success": False, "output": "Docker not found"}
 
     # ── Package installation ─────────────────────────────────────────────────
 

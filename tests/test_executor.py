@@ -290,7 +290,9 @@ def test_execute_sandbox_true_calls_docker(tmp_path: Path, executor: NotebookExe
          patch.object(executor, "_run_subprocess") as mock_sub:
         result = executor.execute(nb, timeout_seconds=30, sandbox=True)
 
-    mock_docker.assert_called_once_with(nb.notebook_path, 30)
+    mock_docker.assert_called_once_with(
+        nb.notebook_path, 30, packages=None, pip_cache_dir=None,
+    )
     mock_sub.assert_not_called()
     assert result.status == "success"
 
@@ -314,6 +316,116 @@ def test_execute_sandbox_false_calls_subprocess(
     mock_sub.assert_called_once()
     mock_docker.assert_not_called()
     assert result.status == "success"
+
+
+def test_run_docker_with_packages_two_phase(tmp_path: Path, executor: NotebookExecutor) -> None:
+    """Verify _run_docker runs install phase then execute phase when packages given."""
+    nb_path = tmp_path / "notebook.py"
+    nb_path.touch()
+
+    install_result = MagicMock()
+    install_result.returncode = 0
+    install_result.stdout = "installed ok"
+    install_result.stderr = ""
+
+    exec_result = MagicMock()
+    exec_result.returncode = 0
+    exec_result.stdout = "hello"
+    exec_result.stderr = ""
+
+    with patch("subprocess.run", side_effect=[install_result, exec_result]) as mock_run:
+        result = executor._run_docker(nb_path, timeout=30, packages=["httpx"])
+
+    assert mock_run.call_count == 2
+    # First call: install phase (no --network=none)
+    install_cmd = mock_run.call_args_list[0][0][0]
+    assert "--entrypoint" in install_cmd
+    assert "--network=none" not in install_cmd
+    assert "--target=/sandbox/.packages" in " ".join(install_cmd)
+    # Second call: execute phase (has --network=none and PYTHONPATH)
+    exec_cmd = mock_run.call_args_list[1][0][0]
+    assert "--network=none" in exec_cmd
+    assert "PYTHONPATH=/sandbox/.packages" in exec_cmd
+    assert result.stdout == "hello"
+
+
+def test_run_docker_no_packages_single_phase(tmp_path: Path, executor: NotebookExecutor) -> None:
+    """Verify _run_docker skips install phase when no packages."""
+    nb_path = tmp_path / "notebook.py"
+    nb_path.touch()
+
+    exec_result = MagicMock()
+    exec_result.returncode = 0
+    exec_result.stdout = ""
+    exec_result.stderr = ""
+
+    with patch("subprocess.run", return_value=exec_result) as mock_run:
+        executor._run_docker(nb_path, timeout=30)
+
+    mock_run.assert_called_once()
+    cmd = mock_run.call_args[0][0]
+    assert "--network=none" in cmd
+    assert "PYTHONPATH=/sandbox/.packages" not in cmd
+
+
+def test_run_docker_install_failure_skips_execute(
+    tmp_path: Path, executor: NotebookExecutor
+) -> None:
+    """Verify _run_docker returns error without executing when install fails."""
+    nb_path = tmp_path / "notebook.py"
+    nb_path.touch()
+
+    install_result = MagicMock()
+    install_result.returncode = 1
+    install_result.stdout = ""
+    install_result.stderr = "no such package"
+
+    with patch("subprocess.run", return_value=install_result) as mock_run:
+        result = executor._run_docker(nb_path, timeout=30, packages=["nonexistent"])
+
+    # Only install phase ran, execute was skipped
+    mock_run.assert_called_once()
+    assert result.returncode == 1
+    assert "Package install failed" in result.stderr
+
+
+def test_docker_install_packages_uses_pip_cache(
+    tmp_path: Path, executor: NotebookExecutor
+) -> None:
+    """Verify _docker_install_packages mounts pip cache volume when provided."""
+    nb_dir = tmp_path / "notebooks"
+    nb_dir.mkdir()
+    cache_dir = tmp_path / "cache"
+
+    install_result = MagicMock()
+    install_result.returncode = 0
+    install_result.stdout = "ok"
+    install_result.stderr = ""
+
+    with patch("subprocess.run", return_value=install_result) as mock_run:
+        result = executor._docker_install_packages(
+            nb_dir, ["httpx"], pip_cache_dir=cache_dir,
+        )
+
+    assert result["success"] is True
+    cmd = mock_run.call_args[0][0]
+    vol_args = " ".join(cmd)
+    assert f"{cache_dir}:/pip-cache:rw" in vol_args
+    assert "--cache-dir=/pip-cache" in vol_args
+
+
+def test_docker_exec_cmd_sets_pythonpath(executor: NotebookExecutor) -> None:
+    """Verify _docker_exec_cmd includes PYTHONPATH when has_packages=True."""
+    cmd = executor._docker_exec_cmd(Path("/tmp/nb"), "notebook.py", has_packages=True)
+    assert "-e" in cmd
+    idx = cmd.index("-e")
+    assert cmd[idx + 1] == "PYTHONPATH=/sandbox/.packages"
+
+
+def test_docker_exec_cmd_no_pythonpath_without_packages(executor: NotebookExecutor) -> None:
+    """Verify _docker_exec_cmd omits PYTHONPATH when has_packages=False."""
+    cmd = executor._docker_exec_cmd(Path("/tmp/nb"), "notebook.py", has_packages=False)
+    assert "PYTHONPATH=/sandbox/.packages" not in cmd
 
 
 def test_execute_async_sandbox_true_uses_docker_cmd(

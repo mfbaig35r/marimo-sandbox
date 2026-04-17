@@ -16,7 +16,8 @@ RUN pip install --no-cache-dir \
     marimo>=0.10.0 \
     hypothesis>=6.0 \
     numpy \
-    pandas
+    pandas \
+    uv
 
 # Non-root user for defence-in-depth
 RUN useradd -m -s /bin/false sandbox

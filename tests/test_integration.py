@@ -271,3 +271,57 @@ def test_docker_sandbox_numpy_available(setup, docker_available: bool) -> None:
     assert result.status == "success", f"stderr: {result.stderr}\nerror: {result.error}"
     assert result.stdout is not None
     assert "numpy" in result.stdout
+
+
+@pytest.mark.slow
+def test_docker_sandbox_with_packages(setup, tmp_path: Path, docker_available: bool) -> None:
+    """Install a package inside Docker and verify it's importable."""
+    if not docker_available:
+        pytest.skip("Docker not available")
+    db, gen, exe = setup
+    code = "import httpx; print(f'httpx {httpx.__version__}')"
+    nb = gen.generate("run_docker_pkg", "Docker package test", code)
+    db.create_run("run_docker_pkg", "Docker package test", code, str(nb.notebook_path))
+
+    pip_cache = tmp_path / "pip-cache"
+    result = exe.execute(
+        nb, timeout_seconds=180, sandbox=True,
+        packages=["httpx"], pip_cache_dir=pip_cache,
+    )
+
+    assert result.status == "success", f"stderr: {result.stderr}\nerror: {result.error}"
+    assert result.stdout is not None
+    assert "httpx" in result.stdout
+
+
+@pytest.mark.slow
+def test_docker_sandbox_packages_network_isolated(
+    setup, tmp_path: Path, docker_available: bool,
+) -> None:
+    """After package install, the execution phase should have no network."""
+    if not docker_available:
+        pytest.skip("Docker not available")
+    db, gen, exe = setup
+    code = (
+        "import httpx\n"
+        "try:\n"
+        "    httpx.get('http://httpbin.org/get', timeout=3)\n"
+        "    print('network worked')\n"
+        "except Exception as e:\n"
+        "    print(f'blocked: {e}')\n"
+    )
+    nb = gen.generate("run_docker_pkg_nonet", "Docker pkg+nonet test", code)
+    db.create_run(
+        "run_docker_pkg_nonet", "Docker pkg+nonet test", code, str(nb.notebook_path),
+    )
+
+    pip_cache = tmp_path / "pip-cache"
+    result = exe.execute(
+        nb, timeout_seconds=180, sandbox=True,
+        packages=["httpx"], pip_cache_dir=pip_cache,
+    )
+
+    assert result.status == "success", f"stderr: {result.stderr}\nerror: {result.error}"
+    assert result.stdout is not None
+    assert "blocked" in result.stdout
+    assert "network worked" not in result.stdout

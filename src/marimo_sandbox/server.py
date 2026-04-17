@@ -249,27 +249,35 @@ def _impl_run_python(
     code_hash = hashlib.sha256(code.encode()).hexdigest()
     run_id = "run_" + secrets.token_hex(4)
 
-    # Resolve packages → hash-based venv (or bare interpreter)
+    # Resolve packages → hash-based venv (host) or pass to Docker (sandbox)
     freeze: str | None = None
     python_path: Path | None = None
     env_hash: str | None = None
+    pip_cache_dir: Path | None = None
     if packages:
-        try:
-            env_info = env_manager.get_or_create(packages)
-            freeze = env_info.freeze or None
-            python_path = env_info.python_path
-            env_hash = env_info.env_hash
-        except Exception as exc:
-            return {
-                "run_id": None,
-                "status": "error",
-                "error": f"Package install failed: {exc}",
-                "stdout": "",
-                "stderr": "",
-                "duration_ms": 0,
-                "notebook_path": None,
-                "view_command": None,
-            }
+        # Always compute env_hash for record-keeping
+        env_hash = env_manager.env_hash(packages)
+        if sandbox:
+            # Docker sandbox: packages installed inside the container (two-phase).
+            # Skip host venv creation — it would be wasted work.
+            pip_cache_dir = DATA_DIR / "docker-pip-cache"
+        else:
+            try:
+                env_info = env_manager.get_or_create(packages)
+                freeze = env_info.freeze or None
+                python_path = env_info.python_path
+                env_hash = env_info.env_hash
+            except Exception as exc:
+                return {
+                    "run_id": None,
+                    "status": "error",
+                    "error": f"Package install failed: {exc}",
+                    "stdout": "",
+                    "stderr": "",
+                    "duration_ms": 0,
+                    "notebook_path": None,
+                    "view_command": None,
+                }
 
     # Generate notebook
     try:
@@ -313,6 +321,8 @@ def _impl_run_python(
             timeout_seconds=timeout_seconds,
             sandbox=sandbox,
             python_path=python_path,
+            packages=packages if sandbox else None,
+            pip_cache_dir=pip_cache_dir,
         )
         db.update_run_pid(run_id, process.pid)
         threading.Thread(
@@ -353,6 +363,8 @@ def _impl_run_python(
         timeout_seconds=timeout_seconds,
         sandbox=sandbox,
         python_path=python_path,
+        packages=packages if sandbox else None,
+        pip_cache_dir=pip_cache_dir,
     )
 
     # Scan for user-created artifact files

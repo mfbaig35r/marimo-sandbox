@@ -354,6 +354,89 @@ def test_get_run_outputs_with_data(tmp_path):
     assert result["outputs"]["labels"] == ["a", "b"]
 
 
+# ── sandbox + packages routing ────────────────────────────────────────────────
+
+
+def test_sandbox_true_skips_env_manager():
+    """sandbox=True with packages should NOT create a host venv."""
+    mock_exec_result = MagicMock()
+    mock_exec_result.status = "success"
+    mock_exec_result.duration_ms = 10
+    mock_exec_result.stdout = "ok"
+    mock_exec_result.stderr = None
+    mock_exec_result.error = None
+
+    mock_nb = MagicMock()
+    mock_nb.notebook_path = Path("/fake/notebook.py")
+    mock_nb.notebook_dir = Path("/fake")
+    mock_nb.result_path = Path("/fake/run_abc_result.json")
+
+    with patch.object(server_module, "db") as mock_db, \
+         patch.object(server_module, "executor") as mock_exec, \
+         patch.object(server_module, "generator") as mock_gen, \
+         patch.object(server_module, "env_manager") as mock_env:
+        mock_gen.generate.return_value = mock_nb
+        mock_exec.execute.return_value = mock_exec_result
+        mock_db.get_run.return_value = None
+        server_module._impl_run_python(
+            code="import httpx",
+            description="sandbox pkg test",
+            timeout_seconds=60,
+            sandbox=True,
+            packages=["httpx"],
+        )
+    # env_manager.get_or_create should NOT be called (host venv not needed)
+    mock_env.get_or_create.assert_not_called()
+    # env_manager.env_hash should be called (for record-keeping)
+    mock_env.env_hash.assert_called_once_with(["httpx"])
+    # executor.execute should receive the packages for Docker install
+    call_kwargs = mock_exec.execute.call_args[1]
+    assert call_kwargs["packages"] == ["httpx"]
+    assert call_kwargs["sandbox"] is True
+
+
+def test_sandbox_false_uses_env_manager():
+    """sandbox=False with packages should create a host venv as usual."""
+    mock_exec_result = MagicMock()
+    mock_exec_result.status = "success"
+    mock_exec_result.duration_ms = 10
+    mock_exec_result.stdout = "ok"
+    mock_exec_result.stderr = None
+    mock_exec_result.error = None
+
+    mock_nb = MagicMock()
+    mock_nb.notebook_path = Path("/fake/notebook.py")
+    mock_nb.notebook_dir = Path("/fake")
+    mock_nb.result_path = Path("/fake/run_abc_result.json")
+
+    mock_env_info = MagicMock()
+    mock_env_info.freeze = "httpx==0.27.0"
+    mock_env_info.python_path = Path("/fake/python")
+    mock_env_info.env_hash = "abc123"
+
+    with patch.object(server_module, "db") as mock_db, \
+         patch.object(server_module, "executor") as mock_exec, \
+         patch.object(server_module, "generator") as mock_gen, \
+         patch.object(server_module, "env_manager") as mock_env:
+        mock_gen.generate.return_value = mock_nb
+        mock_exec.execute.return_value = mock_exec_result
+        mock_env.get_or_create.return_value = mock_env_info
+        mock_db.get_run.return_value = None
+        server_module._impl_run_python(
+            code="import httpx",
+            description="host pkg test",
+            timeout_seconds=60,
+            sandbox=False,
+            packages=["httpx"],
+        )
+    # env_manager.get_or_create SHOULD be called
+    mock_env.get_or_create.assert_called_once_with(["httpx"])
+    # executor.execute should NOT receive packages (host venv handles it)
+    call_kwargs = mock_exec.execute.call_args[1]
+    assert call_kwargs["packages"] is None
+    assert call_kwargs["sandbox"] is False
+
+
 # ── v0.6: dry_run ─────────────────────────────────────────────────────────────
 
 
