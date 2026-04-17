@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.0.8] - 2026-04-17
+
+### Fixed
+- **Docker sandbox was completely broken** — `_run_docker` and `execute_async`
+  passed a redundant `"python"` argument that conflicted with the Dockerfile's
+  `ENTRYPOINT ["python"]`, causing the container to fail with
+  `can't open file '/sandbox/python'`. Removed the duplicate argument from both
+  sync and async paths.
+
+### Added
+- 8 unit tests for Docker sandbox command construction, dispatch routing,
+  custom image support, timeout forwarding, and error handling
+- 5 Docker integration tests: stdout capture, sidecar creation, error propagation,
+  network isolation (`--network=none`), and numpy availability
+- `docker_available` fixture checks for both Docker daemon and the
+  `marimo-sandbox:latest` image — tests skip cleanly in CI
+
 ## [1.0.7] - 2026-04-16
 
 ### Fixed
